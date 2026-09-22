@@ -26,6 +26,14 @@ const tooltipBubbleStyle = (
   whiteSpace: multiline ? 'normal' : 'nowrap',
   maxWidth,
   textAlign: 'center',
+  ...(multiline
+    ? {
+        display: 'block',
+        overflowWrap: 'anywhere',
+        wordBreak: 'break-word',
+        boxSizing: 'border-box',
+      }
+    : {}),
 });
 
 interface FloatingTooltipProps {

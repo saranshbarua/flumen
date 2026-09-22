@@ -713,31 +713,135 @@ final class AgentAccessCoordinator: @unchecked Sendable {
     }
 
     private func proposalSummary(for request: IPCRequest) -> [String: Any] {
+        let operationTitle = humanTitle(for: request.operation)
+        let taskInfo = taskSummary(for: request)
+        let resolvedProjectName = request.parameters["projectId"]?.stringValue.flatMap(projectName(for:))
+
         var summary: [String: Any] = [
             "requestId": request.requestId,
             "action": request.operation,
-            "title": humanTitle(for: request.operation),
             "expiresAt": Date().addingTimeInterval(120).timeIntervalSince1970 * 1000,
             "provenance": [
                 "source": "agent",
                 "origin": request.client.name
             ]
         ]
-        if let title = request.parameters["title"]?.stringValue {
-            summary["task"] = ["title": title]
-        }
-        if let taskId = request.parameters["taskId"]?.stringValue {
-            summary["task"] = ["id": taskId]
+        if !taskInfo.isEmpty {
+            summary["task"] = taskInfo
         }
         if let duration = request.parameters["durationSeconds"]?.intValue {
             summary["durationSeconds"] = duration
         }
         if let projectId = request.parameters["projectId"]?.stringValue {
-            summary["project"] = projectId
+            if let resolvedProjectName {
+                summary["project"] = ["id": projectId, "name": resolvedProjectName]
+            } else {
+                summary["project"] = projectId
+            }
         }
+        let taskTitle = taskInfo["title"] as? String
+        summary["title"] = proposalNotificationTitle(
+            operationTitle: operationTitle,
+            taskTitle: taskTitle
+        )
+        summary["summary"] = proposalNotificationBody(
+            clientName: request.client.name,
+            operation: request.operation,
+            operationTitle: operationTitle,
+            projectName: resolvedProjectName ?? taskInfo["projectName"] as? String,
+            durationSeconds: request.parameters["durationSeconds"]?.intValue,
+            reason: request.parameters["reason"]?.stringValue
+        )
         summary["sideEffects"] = sideEffects(for: request.operation)
-        summary["summary"] = "\(request.client.name) proposes: \(humanTitle(for: request.operation))"
         return summary
+    }
+
+    private func taskSummary(for request: IPCRequest) -> [String: Any] {
+        var info: [String: Any] = [:]
+        if let title = request.parameters["title"]?.stringValue {
+            info["title"] = title
+        }
+
+        switch request.operation {
+        case "correct_time_entry":
+            if let activityId = request.parameters["id"]?.stringValue {
+                info["id"] = activityId
+                if info["title"] == nil, let activity = try? repository.activity(byId: activityId) {
+                    info["title"] = activity["taskTitle"] as? String
+                    if let projectId = activity["projectId"] as? String {
+                        info["projectName"] = projectName(for: projectId)
+                    }
+                }
+            }
+        case "update_task":
+            if let taskId = request.parameters["id"]?.stringValue {
+                info["id"] = taskId
+                if info["title"] == nil {
+                    info["title"] = taskTitle(for: taskId)
+                }
+            }
+        default:
+            if let taskId = request.parameters["taskId"]?.stringValue {
+                info["id"] = taskId
+                if info["title"] == nil {
+                    info["title"] = taskTitle(for: taskId)
+                }
+            }
+        }
+        return info
+    }
+
+    private func taskTitle(for id: String) -> String? {
+        guard let tasks = try? repository.listTasks(includeCompleted: true, limit: 500) else { return nil }
+        return tasks.first(where: { ($0["id"] as? String) == id })?["title"] as? String
+    }
+
+    private func projectName(for id: String) -> String? {
+        guard let projects = try? repository.listProjects() else { return nil }
+        return projects.first(where: { ($0["id"] as? String) == id })?["name"] as? String
+    }
+
+    private func proposalNotificationTitle(operationTitle: String, taskTitle: String?) -> String {
+        if let taskTitle, !taskTitle.isEmpty {
+            return truncated(taskTitle, maxLength: 120)
+        }
+        return operationTitle
+    }
+
+    private func proposalNotificationBody(
+        clientName: String,
+        operation: String,
+        operationTitle: String,
+        projectName: String?,
+        durationSeconds: Int?,
+        reason: String? = nil
+    ) -> String {
+        var segments = [clientName, operationTitle]
+        if let projectName, !projectName.isEmpty {
+            segments.append(projectName)
+        }
+        if let durationSeconds, durationSeconds > 0 {
+            let duration = formatProposalDuration(durationSeconds)
+            segments.append(operation == "correct_time_entry" ? "→ \(duration)" : duration)
+        }
+        if operation == "correct_time_entry", let reason {
+            let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                segments.append(truncated(trimmed, maxLength: 72))
+            }
+        }
+        return segments.joined(separator: " · ")
+    }
+
+    private func formatProposalDuration(_ seconds: Int) -> String {
+        let minutes = max(1, Int(round(Double(seconds) / 60)))
+        if minutes < 60 { return "\(minutes) min" }
+        return "\(minutes / 60)h \(minutes % 60)m"
+    }
+
+    private func truncated(_ string: String, maxLength: Int) -> String {
+        guard string.count > maxLength else { return string }
+        return String(string.prefix(maxLength - 1)) + "…"
     }
 
     private func humanTitle(for operation: String) -> String {

@@ -224,6 +224,15 @@ public final class AppRepository: @unchecked Sendable {
         }
     }
 
+    public func activity(byId id: String) throws -> [String: Any]? {
+        try database.dbPool.read { db in
+            guard let row = try Row.fetchOne(db, sql: "SELECT * FROM session_logs WHERE id = ?", arguments: [id]) else {
+                return nil
+            }
+            return activityDictionary(row)
+        }
+    }
+
     public func queryActivity(
         start: Date,
         end: Date,
@@ -293,10 +302,10 @@ public final class AppRepository: @unchecked Sendable {
         let limit = max(1, min(limit, 50))
         return try database.dbPool.read { db in
             var sql = """
-                SELECT COALESCE(l.task_title, t.title, 'Unselected Activity') title,
-                       l.task_id, l.project_id, SUM(l.duration_seconds) actual_seconds,
-                       MAX(COALESCE(t.estimated_pomos, l.estimated_pomos, 1)) estimated_pomos,
-                       COUNT(*) activity_count, MAX(l.timestamp) last_active
+                SELECT COALESCE(l.task_title, t.title, 'Unselected Activity') AS title,
+                       l.task_id, l.project_id, SUM(l.duration_seconds) AS actual_seconds,
+                       MAX(COALESCE(t.estimated_pomos, l.estimated_pomos, 1)) AS estimated_pomos,
+                       COUNT(*) AS activity_count, MAX(l.timestamp) AS last_active
                 FROM session_logs l LEFT JOIN tasks t ON t.id = l.task_id WHERE 1 = 1
                 """
             var args = StatementArguments()
@@ -308,7 +317,12 @@ public final class AppRepository: @unchecked Sendable {
                 sql += " AND l.project_id = ?"
                 args += [projectId]
             }
-            sql += " GROUP BY title, l.task_id, l.project_id ORDER BY last_active DESC LIMIT ?"
+            // Group by concrete columns — alias `title` collides with tasks.title.
+            sql += """
+                 GROUP BY COALESCE(l.task_title, t.title, 'Unselected Activity'),
+                          l.task_id, l.project_id
+                 ORDER BY last_active DESC LIMIT ?
+                """
             args += [limit]
             let rows = try Row.fetchAll(db, sql: sql, arguments: args)
             return ["comparables": rows.map {
@@ -403,9 +417,11 @@ public final class AppRepository: @unchecked Sendable {
                 GROUP BY date ORDER BY date
                 """)
             let projects = try Row.fetchAll(db, sql: """
-                SELECT COALESCE(p.name, l.tag, 'Untagged') name, SUM(l.duration_seconds) / 3600.0 value
+                SELECT COALESCE(p.name, l.tag, 'Untagged') AS name,
+                       SUM(l.duration_seconds) / 3600.0 AS value
                 FROM session_logs l LEFT JOIN projects p ON l.project_id = p.id
-                GROUP BY name ORDER BY value DESC
+                GROUP BY COALESCE(p.name, l.tag, 'Untagged')
+                ORDER BY value DESC
                 """)
             let breakdown = try fetchReportBreakdown(db)
             let total = try Int.fetchOne(db, sql: "SELECT COALESCE(SUM(duration_seconds), 0) FROM session_logs") ?? 0
@@ -518,16 +534,30 @@ private func activityDictionary(_ row: Row) -> [String: Any] {
 }
 
 private func fetchReportBreakdown(_ db: Database) throws -> [[String: Any]] {
+    // Group linked-task logs by task_id so mixed tag/title snapshots on the same
+    // task collapse into one row. Ad-hoc logs (no task_id) still group by the
+    // displayed title + project/tag label.
+    //
+    // Avoid GROUP BY on aliases `title`/`tag` — they collide with tasks.title /
+    // tasks.tag / session_logs.tag and fail under SQLite's ambiguous-column rules.
     let rows = try Row.fetchAll(db, sql: """
-        SELECT COALESCE(l.task_title, t.title, 'Unselected Activity') title,
-               COALESCE(p.name, l.tag, 'Untagged') tag, SUM(l.duration_seconds) duration,
-               COALESCE(t.estimated_pomos, MAX(l.estimated_pomos), 1) estimated_pomos,
-               AVG(l.snapshot_focus_duration) avg_snapshot_duration,
-               DATE(MAX(l.timestamp), '+' || l.timezone_offset || ' minutes') last_active
+        SELECT COALESCE(MAX(t.title), MAX(l.task_title), 'Unselected Activity') AS title,
+               COALESCE(MAX(p.name), MAX(t.tag), MAX(l.tag), 'Untagged') AS tag,
+               SUM(l.duration_seconds) AS duration,
+               COALESCE(MAX(t.estimated_pomos), MAX(l.estimated_pomos), 1) AS estimated_pomos,
+               AVG(l.snapshot_focus_duration) AS avg_snapshot_duration,
+               MAX(DATE(l.timestamp, '+' || l.timezone_offset || ' minutes')) AS last_active
         FROM session_logs l
         LEFT JOIN tasks t ON l.task_id = t.id
         LEFT JOIN projects p ON l.project_id = p.id
-        GROUP BY title, tag ORDER BY MAX(l.timestamp) DESC
+        GROUP BY COALESCE(l.task_id, ''),
+                 CASE WHEN l.task_id IS NULL
+                      THEN COALESCE(l.task_title, 'Unselected Activity')
+                      ELSE '' END,
+                 CASE WHEN l.task_id IS NULL
+                      THEN COALESCE(p.name, l.tag, 'Untagged')
+                      ELSE '' END
+        ORDER BY MAX(l.timestamp) DESC
         """)
     return rows.map {
         [

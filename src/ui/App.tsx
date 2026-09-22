@@ -515,7 +515,7 @@ const App: React.FC = () => {
                 </svg>
               )}
               {activeTask?.title ? (
-                <Tooltip label={activeTask.title} maxWidth={280}>
+                <Tooltip label={activeTask.title} maxWidth={280} multiline>
                   <span 
                     style={{ 
                   fontSize: '14px', 
