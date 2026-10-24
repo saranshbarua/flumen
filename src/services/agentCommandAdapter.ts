@@ -9,6 +9,8 @@ export interface AgentCommand {
   command?: string;
   name?: string;
   confirmed?: boolean;
+  /** Check preconditions only; never mutate. */
+  dryRun?: boolean;
   /** Epoch ms after which native has already reported a timeout, so a mutation must not run. */
   deadline?: number;
   arguments?: Record<string, unknown>;
@@ -56,6 +58,9 @@ const getStatus = (requestId: string, now = Date.now()): AgentCommandResult => {
             : null,
       },
       activeTask,
+      config: {
+        focusDurationSeconds: pomodoro.config.focusDuration,
+      },
     },
   };
 };
@@ -78,7 +83,12 @@ export const executeAgentCommand = (
     return getStatus(requestId, now);
   }
 
-  if (!input?.confirmed) {
+  // A dry run applies every precondition but changes nothing, so native can refuse an
+  // impossible proposal before asking the person to approve it.
+  const dryRun = input?.dryRun === true;
+  const wouldApply = (): AgentCommandResult => ({ ok: true, requestId, data: { wouldApply: true } });
+
+  if (!dryRun && !input?.confirmed) {
     return fail(
       requestId,
       'confirmation_required',
@@ -86,7 +96,7 @@ export const executeAgentCommand = (
     );
   }
 
-  if (typeof input.deadline === 'number' && now > input.deadline) {
+  if (!dryRun && typeof input.deadline === 'number' && now > input.deadline) {
     return fail(
       requestId,
       'command_expired',
@@ -104,6 +114,7 @@ export const executeAgentCommand = (
       if (!task || task.status !== 0) {
         return fail(requestId, 'task_not_found', 'Choose an active, incomplete Flumen task.');
       }
+      if (dryRun) return wouldApply();
       taskStore.setActiveTask(task.id);
       return { ok: true, requestId, data: { activeTaskId: task.id } };
     }
@@ -124,7 +135,10 @@ export const executeAgentCommand = (
       if (taskId) {
         const selected = taskStore.tasks.find((task) => task.id === taskId && task.status === 0);
         if (!selected) return fail(requestId, 'task_not_found', 'The requested task is unavailable.');
+        if (dryRun) return wouldApply();
         taskStore.setActiveTask(taskId);
+      } else if (dryRun) {
+        return wouldApply();
       } else {
         const taskPayload =
           args.task && typeof args.task === 'object'
@@ -159,6 +173,7 @@ export const executeAgentCommand = (
       if (pomodoro.timer.status !== 'paused') {
         return fail(requestId, 'timer_not_paused', 'There is no paused timer to resume.');
       }
+      if (dryRun) return wouldApply();
       pomodoro.startTimer(now);
       return { ok: true, requestId, data: { resumedAt: now } };
 
@@ -168,6 +183,7 @@ export const executeAgentCommand = (
       if (pomodoro.timer.status !== 'running') {
         return fail(requestId, 'timer_not_running', 'There is no running timer to pause.');
       }
+      if (dryRun) return wouldApply();
       pomodoro.pauseTimer();
       return { ok: true, requestId, data: { pausedAt: now } };
 
@@ -177,6 +193,7 @@ export const executeAgentCommand = (
       if (pomodoro.timer.status !== 'running' && pomodoro.timer.status !== 'paused') {
         return fail(requestId, 'timer_not_active', 'There is no active timer to finish.');
       }
+      if (dryRun) return wouldApply();
       pomodoro.skipTimer();
       return { ok: true, requestId, data: { finishedAt: now } };
 
@@ -184,6 +201,7 @@ export const executeAgentCommand = (
       const taskId = asString(args.taskId ?? args.id) || taskStore.activeTaskId;
       const task = taskStore.tasks.find((candidate) => candidate.id === taskId);
       if (!task) return fail(requestId, 'task_not_found', 'The requested task is unavailable.');
+      if (dryRun) return wouldApply();
       if (!task.isCompleted) taskStore.toggleTask(task.id);
       return { ok: true, requestId, data: { taskId: task.id, isCompleted: true } };
     }

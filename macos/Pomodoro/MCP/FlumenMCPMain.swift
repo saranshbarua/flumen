@@ -242,11 +242,31 @@ private func registerTools(on server: Server, proxy: FlumenIPCProxy) async {
             "completeTask": .object(["type": .string("boolean")]),
             "idempotencyKey": .object(["type": .string("string")])
         ]),
-        tool("complete_task", proposalDescription("Propose completing a Flumen task. Requires expectedRevision from list_tasks."), [
+        tool("complete_task", proposalDescription("Propose marking one task done without logging any sessions or time. Requires expectedRevision from list_tasks. To record the work (fill 0/3 to 3/3 and log the time), use complete_tasks."), [
             "taskId": .object(["type": .string("string")]),
             "expectedRevision": .object(["type": .string("integer")]),
             "idempotencyKey": .object(["type": .string("string")])
         ], required: ["taskId", "expectedRevision"]),
+        tool("complete_tasks", proposalDescription(
+            "Propose completing one or more tasks as finished work, in one confirmation. For each task, logs its remaining sessions "
+            + "(estimate minus completed) at the person's focus length, fills the session count to the estimate, and marks it done. "
+            + "Sessions are placed back-to-back ending now unless startedAt is given, count as completed sessions, and are recorded as logged by this agent. "
+            + "Refused if the time overlaps existing logs. Do not drive the timer to fill sessions."
+        ), [
+            "tasks": .object([
+                "type": .string("array"),
+                "items": .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "taskId": .object(["type": .string("string")]),
+                        "expectedRevision": .object(["type": .string("integer")])
+                    ]),
+                    "required": .array([.string("taskId"), .string("expectedRevision")])
+                ])
+            ]),
+            "startedAt": .object(["type": .string("string"), "description": .string("Optional ISO-8601 start of the first session.")]),
+            "idempotencyKey": .object(["type": .string("string")])
+        ], required: ["tasks"]),
         tool("reopen_task", proposalDescription("Propose moving a completed task back to the open Task Shelf. Requires expectedRevision from list_tasks with includeCompleted."), [
             "taskId": .object(["type": .string("string")]),
             "expectedRevision": .object(["type": .string("integer")]),
@@ -325,7 +345,8 @@ private func structuredErrorPayload(_ error: IPCStructuredError) -> String {
 }
 
 private func proposalDescription(_ summary: String) -> String {
-    "\(summary) Opens a confirmation in Flumen and waits up to \(Int(FlumenIPC.confirmationWindow)) seconds for the person to approve or decline. "
+    "\(summary) Flumen checks the request first and returns an error immediately, with no confirmation, if it cannot apply. "
+        + "Otherwise it opens a confirmation in Flumen and waits up to \(Int(FlumenIPC.confirmationWindow)) seconds for the person to approve or decline. "
         + "Pass a fresh idempotencyKey per change; reusing a key with different arguments returns idempotency_conflict."
 }
 

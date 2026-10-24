@@ -127,6 +127,26 @@ describe('executeAgentCommand', () => {
     expect(useTaskStore.getState().tasks).toHaveLength(0);
   });
 
+  it('dry-run refuses begin_focus during a break without asking for confirmation', () => {
+    usePomodoroStore.setState({ session: { type: 'shortBreak', cycle: 1 } } as any);
+    const result = executeAgentCommand({ requestId: 'd1', command: 'begin_focus', dryRun: true, arguments: { title: 'X' } });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe('not_focus_session');
+  });
+
+  it('dry-run validates without changing timer or tasks', () => {
+    const result = executeAgentCommand({ requestId: 'd2', command: 'begin_focus', dryRun: true, arguments: { title: 'X' } });
+    expect(result).toEqual({ ok: true, requestId: 'd2', data: { wouldApply: true } });
+    expect(usePomodoroStore.getState().timer.status).toBe('idle');
+    expect(useTaskStore.getState().tasks).toHaveLength(0);
+  });
+
+  it('reports the focus length in status', () => {
+    const result = executeAgentCommand({ requestId: 'd3', command: 'get_status' });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect((result.data.config as { focusDurationSeconds: number }).focusDurationSeconds).toBeGreaterThan(0);
+  });
+
   it('still answers status reads after the deadline', () => {
     const now = 1_700_000_000_000;
     const result = executeAgentCommand({ requestId: 'r13', command: 'get_status', deadline: now - 1 }, now);

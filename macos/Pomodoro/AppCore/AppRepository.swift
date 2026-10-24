@@ -112,69 +112,19 @@ public final class AppRepository: @unchecked Sendable {
         externalReference: String? = nil,
         idempotencyKey: String? = nil
     ) throws -> [String: Any] {
-        guard (1...86_400).contains(duration) else { throw validation("durationSeconds must be between 1 and 86400.") }
         guard ["timer", "manual", "agent"].contains(source) else { throw validation("Invalid activity source.") }
         guard ["observed", "user_supplied", "inferred"].contains(durationOrigin) else { throw validation("Invalid duration origin.") }
         let activityID = UUID().uuidString
         let recordedAt = Date()
         let offset = TimeZone.current.secondsFromGMT(for: timestamp) / 60
-        let end = timestamp.addingTimeInterval(TimeInterval(duration))
-        // Reject not-yet-started work. Ends may sit slightly ahead of "now" when a
-        // caller supplies start=now with a duration (common for immediate logs).
-        if timestamp > recordedAt.addingTimeInterval(120) {
-            throw validation("Activity cannot start more than two minutes in the future.")
-        }
-        if end > recordedAt.addingTimeInterval(86_400) {
-            throw validation("Activity end time is more than 24 hours in the future.")
-        }
+        try validateActivityWindow(duration: duration, start: timestamp, now: recordedAt)
 
         return try database.dbPool.write { db in
-            if let idempotencyKey, let sourceClient,
-               let row = try Row.fetchOne(
-                   db,
-                   sql: "SELECT * FROM session_logs WHERE source_client = ? AND idempotency_key = ?",
-                   arguments: [sourceClient, idempotencyKey]
-               ) {
-                return activityDictionary(row)
+            if let existing = try existingIdempotentActivity(sourceClient: sourceClient, idempotencyKey: idempotencyKey, in: db) {
+                return activityDictionary(existing)
             }
-            try ensureProject(projectId, in: db)
-            if let taskId {
-                guard try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM tasks WHERE id = ?", arguments: [taskId]) == 1 else {
-                    throw notFound("task", taskId)
-                }
-            }
-
-            // Durations are capped at 24h, so only rows starting in the prior day can overlap.
-            // The lower bound keeps this an indexed range scan instead of a full-history filter.
-            let overlaps = try Row.fetchAll(db, sql: """
-                SELECT * FROM session_logs
-                WHERE timestamp < ? AND timestamp > ?
-                  AND DATETIME(timestamp, '+' || duration_seconds || ' seconds') > ?
-                LIMIT 10
-                """, arguments: [end, timestamp.addingTimeInterval(-86_400), timestamp])
-            if let exact = overlaps.first(where: {
-                let existingStart: Date = $0["timestamp"]
-                let existingDuration: Int = $0["duration_seconds"]
-                let existingTitle: String? = $0["task_title"]
-                let existingProject: String? = $0["project_id"]
-                return abs(existingStart.timeIntervalSince(timestamp)) < 0.5
-                    && existingDuration == duration
-                    && existingTitle == clean(taskTitle)
-                    && existingProject == clean(projectId)
-            }) {
-                throw IPCStructuredError(
-                    code: "duplicate_activity",
-                    message: "An exact duplicate activity already exists.",
-                    details: ["activityId": .string(exact["id"] as String)]
-                )
-            }
-            if !overlaps.isEmpty {
-                throw IPCStructuredError(
-                    code: "activity_overlap",
-                    message: "The proposed time overlaps existing recorded activity.",
-                    details: ["activityIds": .array(overlaps.map { .string($0["id"] as String) })]
-                )
-            }
+            try ensureActivityReferences(taskId: taskId, projectId: projectId, in: db)
+            try ensureNoOverlap(start: timestamp, duration: duration, taskTitle: taskTitle, projectId: projectId, in: db)
 
             try db.execute(sql: """
                 INSERT INTO session_logs
@@ -191,6 +141,153 @@ public final class AppRepository: @unchecked Sendable {
                 ])
             let row = try Row.fetchOne(db, sql: "SELECT * FROM session_logs WHERE id = ?", arguments: [activityID])!
             return activityDictionary(row)
+        }
+    }
+
+    // MARK: - Agent pre-checks (read-only; mirror the write paths so impossible proposals never reach the person)
+
+    public func checkNewActivity(
+        duration: Int,
+        timestamp: Date,
+        taskId: String?,
+        taskTitle: String?,
+        projectId: String?,
+        sourceClient: String?,
+        idempotencyKey: String?
+    ) throws {
+        try validateActivityWindow(duration: duration, start: timestamp, now: Date())
+        try database.dbPool.read { db in
+            if try existingIdempotentActivity(sourceClient: sourceClient, idempotencyKey: idempotencyKey, in: db) != nil { return }
+            try ensureActivityReferences(taskId: taskId, projectId: projectId, in: db)
+            try ensureNoOverlap(start: timestamp, duration: duration, taskTitle: taskTitle, projectId: projectId, in: db)
+        }
+    }
+
+    public func checkNewTask(title: String, estimatedPomos: Int, projectId: String?) throws {
+        _ = try validatedTitle(title)
+        guard (1...100).contains(estimatedPomos) else { throw validation("estimatedPomos must be between 1 and 100.") }
+        try database.dbPool.read { db in try ensureProject(projectId, in: db) }
+    }
+
+    /// - Parameter requiredStatus: 0 open, 1 completed; nil accepts any non-archived status.
+    public func checkTask(id: String, expectedRevision: Int, requiredStatus: Int? = nil) throws {
+        try database.dbPool.read { db in
+            guard let row = try Row.fetchOne(db, sql: "SELECT revision, status FROM tasks WHERE id = ?", arguments: [id]) else {
+                throw notFound("task", id)
+            }
+            let revision: Int = row["revision"]
+            guard revision == expectedRevision else {
+                throw conflict("Task was changed since you read it. Read it again for the current revision.", currentRevision: revision)
+            }
+            let status: Int = row["status"]
+            if status == 2 { throw validation("Task \(id) is archived.") }
+            if let requiredStatus, status != requiredStatus {
+                throw validation(requiredStatus == 0 ? "Task \(id) is already complete." : "Task \(id) is not complete.")
+            }
+        }
+    }
+
+    public func checkActivity(id: String, expectedRevision: Int, projectId: String?) throws {
+        try database.dbPool.read { db in
+            guard let revision = try Int.fetchOne(db, sql: "SELECT revision FROM session_logs WHERE id = ?", arguments: [id]) else {
+                throw notFound("activity", id)
+            }
+            guard revision == expectedRevision else {
+                throw conflict("Activity was changed since you read it. Read it again for the current revision.", currentRevision: revision)
+            }
+            try ensureProject(projectId, in: db)
+        }
+    }
+
+    // MARK: - Completing tasks with their sessions
+
+    /// What completing a task will record: the sessions still missing from its estimate.
+    public struct TaskCompletionPlanItem: Sendable {
+        public let taskId: String
+        public let expectedRevision: Int
+        public let title: String
+        public let remainingSessions: Int
+    }
+
+    /// Validates that each task is open at the expected revision and returns how many sessions it still needs.
+    public func planTaskCompletions(_ requests: [(taskId: String, expectedRevision: Int)]) throws -> [TaskCompletionPlanItem] {
+        guard !requests.isEmpty else { throw validation("tasks must list at least one task.") }
+        guard requests.count <= 50 else { throw validation("Complete at most 50 tasks at a time.") }
+        guard Set(requests.map(\.taskId)).count == requests.count else { throw validation("tasks lists the same task more than once.") }
+        return try database.dbPool.read { db in
+            try requests.map { request in
+                let row = try openTaskRow(id: request.taskId, expectedRevision: request.expectedRevision, in: db)
+                let estimated: Int = row["estimated_pomos"]
+                let completed: Int = row["completed_pomos"]
+                return TaskCompletionPlanItem(
+                    taskId: request.taskId,
+                    expectedRevision: request.expectedRevision,
+                    title: row["title"],
+                    remainingSessions: max(0, estimated - completed)
+                )
+            }
+        }
+    }
+
+    /// Logs each task's remaining sessions back-to-back from `start`, fills its session count to the
+    /// estimate, and marks it complete, all in one transaction. Sessions count as completed focus
+    /// cycles and are recorded with source `agent` so their origin stays visible.
+    public func completeTasksWithSessions(
+        _ plan: [TaskCompletionPlanItem],
+        sessionSeconds: Int,
+        start: Date,
+        sourceClient: String
+    ) throws -> [String: Any] {
+        guard (60...14_400).contains(sessionSeconds) else { throw validation("Session length must be between 1 and 240 minutes.") }
+        let totalSeconds = plan.reduce(0) { $0 + $1.remainingSessions } * sessionSeconds
+        let end = start.addingTimeInterval(TimeInterval(totalSeconds))
+        let now = Date()
+        if totalSeconds > 86_400 { throw validation("Logged sessions cannot exceed 24 hours in one request.") }
+        if end > now.addingTimeInterval(120) { throw validation("Logged sessions cannot end in the future. Use an earlier startedAt.") }
+
+        return try database.dbPool.write { db in
+            var rows: [String: Row] = [:]
+            for item in plan {
+                let row = try openTaskRow(id: item.taskId, expectedRevision: item.expectedRevision, in: db)
+                let remaining = max(0, (row["estimated_pomos"] as Int) - (row["completed_pomos"] as Int))
+                guard remaining == item.remainingSessions else {
+                    throw conflict("Task \(item.taskId) changed after approval.", currentRevision: row["revision"])
+                }
+                rows[item.taskId] = row
+            }
+            if totalSeconds > 0 {
+                try ensureNoOverlap(start: start, duration: totalSeconds, taskTitle: nil, projectId: nil, in: db)
+            }
+
+            var cursor = start
+            var sessions: [[String: Any]] = []
+            var tasks: [[String: Any]] = []
+            for item in plan {
+                let row = rows[item.taskId]!
+                for _ in 0..<item.remainingSessions {
+                    let id = UUID().uuidString
+                    try db.execute(sql: """
+                        INSERT INTO session_logs
+                        (id, task_id, task_title, tag, project_id, estimated_pomos, snapshot_focus_duration,
+                         duration_seconds, is_completion, timestamp, timezone_offset, source, duration_origin,
+                         recorded_at, source_client, revision)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'agent', 'inferred', ?, ?, 1)
+                        """, arguments: [
+                            id, item.taskId, row["title"] as String, row["tag"] as String?, row["project_id"] as String?,
+                            row["estimated_pomos"] as Int, sessionSeconds, sessionSeconds,
+                            cursor, TimeZone.current.secondsFromGMT(for: cursor) / 60, now, clean(sourceClient)
+                        ])
+                    sessions.append(activityDictionary(try Row.fetchOne(db, sql: "SELECT * FROM session_logs WHERE id = ?", arguments: [id])!))
+                    cursor = cursor.addingTimeInterval(TimeInterval(sessionSeconds))
+                }
+                try db.execute(sql: """
+                    UPDATE tasks SET completed_pomos = MAX(completed_pomos, estimated_pomos), status = 1, is_completed = 1,
+                        revision = revision + 1, updated_at = ?
+                    WHERE id = ?
+                    """, arguments: [now, item.taskId])
+                tasks.append(taskDictionary(try Row.fetchOne(db, sql: "SELECT * FROM tasks WHERE id = ?", arguments: [item.taskId])!))
+            }
+            return ["tasks": tasks, "sessions": sessions, "totalSeconds": totalSeconds]
         }
     }
 
@@ -509,6 +606,86 @@ private func validatedTitle(_ value: String) throws -> String {
     let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !value.isEmpty, value.count <= 300 else { throw validation("Title must be between 1 and 300 characters.") }
     return value
+}
+
+private func validateActivityWindow(duration: Int, start: Date, now: Date) throws {
+    guard (1...86_400).contains(duration) else { throw validation("durationSeconds must be between 1 and 86400.") }
+    // Reject not-yet-started work. Ends may sit slightly ahead of "now" when a
+    // caller supplies start=now with a duration (common for immediate logs).
+    if start > now.addingTimeInterval(120) {
+        throw validation("Activity cannot start more than two minutes in the future.")
+    }
+    if start.addingTimeInterval(TimeInterval(duration)) > now.addingTimeInterval(86_400) {
+        throw validation("Activity end time is more than 24 hours in the future.")
+    }
+}
+
+private func existingIdempotentActivity(sourceClient: String?, idempotencyKey: String?, in db: Database) throws -> Row? {
+    guard let idempotencyKey, let sourceClient else { return nil }
+    return try Row.fetchOne(
+        db,
+        sql: "SELECT * FROM session_logs WHERE source_client = ? AND idempotency_key = ?",
+        arguments: [sourceClient, idempotencyKey]
+    )
+}
+
+private func ensureActivityReferences(taskId: String?, projectId: String?, in db: Database) throws {
+    try ensureProject(projectId, in: db)
+    if let taskId {
+        guard try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM tasks WHERE id = ?", arguments: [taskId]) == 1 else {
+            throw notFound("task", taskId)
+        }
+    }
+}
+
+/// Durations are capped at 24h, so only rows starting in the prior day can overlap.
+/// The lower bound keeps this an indexed range scan instead of a full-history filter.
+private func ensureNoOverlap(start: Date, duration: Int, taskTitle: String?, projectId: String?, in db: Database) throws {
+    let end = start.addingTimeInterval(TimeInterval(duration))
+    let overlaps = try Row.fetchAll(db, sql: """
+        SELECT * FROM session_logs
+        WHERE timestamp < ? AND timestamp > ?
+          AND DATETIME(timestamp, '+' || duration_seconds || ' seconds') > ?
+        LIMIT 10
+        """, arguments: [end, start.addingTimeInterval(-86_400), start])
+    if let exact = overlaps.first(where: {
+        let existingStart: Date = $0["timestamp"]
+        let existingDuration: Int = $0["duration_seconds"]
+        let existingTitle: String? = $0["task_title"]
+        let existingProject: String? = $0["project_id"]
+        return abs(existingStart.timeIntervalSince(start)) < 0.5
+            && existingDuration == duration
+            && existingTitle == clean(taskTitle)
+            && existingProject == clean(projectId)
+    }) {
+        throw IPCStructuredError(
+            code: "duplicate_activity",
+            message: "An exact duplicate activity already exists.",
+            details: ["activityId": .string(exact["id"] as String)]
+        )
+    }
+    if !overlaps.isEmpty {
+        throw IPCStructuredError(
+            code: "activity_overlap",
+            message: "The proposed time overlaps existing recorded activity.",
+            details: ["activityIds": .array(overlaps.map { .string($0["id"] as String) })]
+        )
+    }
+}
+
+private func openTaskRow(id: String, expectedRevision: Int, in db: Database) throws -> Row {
+    guard let row = try Row.fetchOne(db, sql: "SELECT * FROM tasks WHERE id = ?", arguments: [id]) else {
+        throw notFound("task", id)
+    }
+    let revision: Int = row["revision"]
+    guard revision == expectedRevision else {
+        throw conflict("Task \(id) was changed since you read it. Read it again for the current revision.", currentRevision: revision)
+    }
+    let status: Int = row["status"]
+    guard status == 0 else {
+        throw validation(status == 1 ? "Task \(id) is already complete." : "Task \(id) is archived.")
+    }
+    return row
 }
 
 private func ensureProject(_ id: String?, in db: Database) throws {

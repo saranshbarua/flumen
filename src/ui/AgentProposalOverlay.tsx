@@ -14,6 +14,8 @@ export interface AgentProposal {
   startedAt?: number;
   endedAt?: number;
   reason?: string;
+  /** Per-task breakdown for batch proposals such as complete_tasks. */
+  items?: { title: string; sessions: number; durationSeconds: number }[];
   provenance?: {
     origin?: string;
     durationSource?: string;
@@ -128,6 +130,21 @@ const AgentProposalOverlay: React.FC<AgentProposalOverlayProps> = ({
           />
         </dl>
 
+        {proposal.items && proposal.items.length > 0 && (
+          <ul aria-label="Tasks" style={itemListStyle}>
+            {proposal.items.map((item, index) => (
+              <li key={`${item.title}-${index}`} style={itemRowStyle}>
+                <span style={itemTitleStyle}>{item.title}</span>
+                <span style={itemMetaStyle}>
+                  {item.sessions > 0
+                    ? `${item.sessions} session${item.sessions === 1 ? '' : 's'} · ${formatDuration(item.durationSeconds)}`
+                    : 'No time to log'}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+
         {sideEffects.length > 0 && (
           <div style={effectsStyle}>
             <span style={effectLabelStyle}>WHAT WILL CHANGE</span>
@@ -188,6 +205,10 @@ const detailListStyle: React.CSSProperties = { margin: 0, padding: 11, borderRad
 const detailRowStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: '70px 1fr', gap: 8 };
 const termStyle: React.CSSProperties = { color: 'rgba(255,255,255,.32)', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.08em' };
 const valueStyle: React.CSSProperties = { margin: 0, color: 'rgba(255,255,255,.82)', fontSize: 11, overflowWrap: 'anywhere' };
+const itemListStyle: React.CSSProperties = { listStyle: 'none', margin: '8px 0 0', padding: 11, borderRadius: 12, background: 'rgba(255,255,255,.035)', display: 'flex', flexDirection: 'column', gap: 7 };
+const itemRowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 11 };
+const itemTitleStyle: React.CSSProperties = { color: 'rgba(255,255,255,.82)', overflowWrap: 'anywhere' };
+const itemMetaStyle: React.CSSProperties = { color: 'rgba(255,255,255,.45)', whiteSpace: 'nowrap' };
 const effectsStyle: React.CSSProperties = { marginTop: 11, padding: 11, borderRadius: 12, border: '1px solid rgba(255,159,10,.14)', background: 'rgba(255,159,10,.06)', display: 'flex', flexDirection: 'column', gap: 5, color: 'rgba(255,255,255,.65)', fontSize: 10 };
 const effectLabelStyle: React.CSSProperties = { color: '#FFB340', fontSize: 8, fontWeight: 800, letterSpacing: '.1em' };
 const expiryStyle: React.CSSProperties = { margin: '10px 0', color: 'rgba(255,255,255,.38)', fontSize: 9, textAlign: 'center' };

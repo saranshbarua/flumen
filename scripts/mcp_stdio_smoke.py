@@ -44,6 +44,7 @@ EXPECTED_TOOLS = {
     "pause_focus",
     "finish_focus",
     "complete_task",
+    "complete_tasks",
     "reopen_task",
     "correct_time_entry",
 }

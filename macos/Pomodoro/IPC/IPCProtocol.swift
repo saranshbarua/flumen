@@ -25,7 +25,7 @@ public enum AgentOperationCatalog {
     public static let writes: Set<String> = [
         "log_time", "create_task", "update_task", "set_active_task",
         "begin_focus", "resume_focus", "pause_focus", "finish_focus",
-        "complete_task", "reopen_task", "correct_time_entry"
+        "complete_task", "complete_tasks", "reopen_task", "correct_time_entry"
     ]
 
     public static func isWrite(_ operation: String) -> Bool { writes.contains(operation) }

@@ -382,10 +382,29 @@ final class AgentAccessCoordinator: @unchecked Sendable {
 
     // MARK: - Proposals
 
+    private struct ProposalContext {
+        var activeTask: [String: Any]?
+        var completion: CompletionPlan?
+    }
+
+    /// The exact sessions a `complete_tasks` card shows; execution records this plan, not a recomputed one.
+    private struct CompletionPlan: Sendable {
+        let items: [AppRepository.TaskCompletionPlanItem]
+        let sessionSeconds: Int
+        let start: Date
+        var sessionCount: Int { items.reduce(0) { $0 + $1.remainingSessions } }
+        var totalSeconds: Int { sessionCount * sessionSeconds }
+        var end: Date { start.addingTimeInterval(TimeInterval(totalSeconds)) }
+    }
+
     private func proposeAndExecute(_ request: IPCRequest) async throws -> JSONValue {
         let requestId = request.requestId
-        let activeTask = await activeTaskForSummary(request)
-        let summary = proposalSummary(for: request, activeTask: activeTask)
+        let context = try await buildContext(for: request)
+        // Refuse anything that cannot apply before asking the person, so an agent retrying an
+        // invalid action gets an immediate error instead of a stream of doomed approvals.
+        try await preflight(request, context: context)
+        let summary = proposalSummary(for: request, context: context)
+        let completion = context.completion
         proposals.register(requestId: requestId, summary: summary, window: FlumenIPC.confirmationWindow)
 
         DispatchQueue.main.async { [weak self] in
@@ -406,7 +425,7 @@ final class AgentAccessCoordinator: @unchecked Sendable {
 
         do {
             let result = try await mutationQueue.run { [self] in
-                try await self.executeApproved(request)
+                try await self.executeApproved(request, completion: completion)
             }
             settleProposalUI(requestId: requestId, outcome: "applied", message: nil)
             return result
@@ -434,13 +453,154 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         }
     }
 
-    private func activeTaskForSummary(_ request: IPCRequest) async -> [String: Any]? {
-        guard request.operation == "finish_focus", request.parameters["completeTask"]?.boolValue == true else { return nil }
-        let status = try? await timerCommand(["command": "get_status", "confirmed": false])
-        return status?["activeTask"]?.anyValue as? [String: Any]
+    private func buildContext(for request: IPCRequest) async throws -> ProposalContext {
+        var context = ProposalContext()
+        switch request.operation {
+        case "finish_focus" where request.parameters["completeTask"]?.boolValue == true:
+            let status = try? await timerCommand(["command": "get_status", "confirmed": false])
+            context.activeTask = status?["activeTask"]?.anyValue as? [String: Any]
+        case "complete_tasks":
+            context.completion = try await completionPlan(for: request)
+        default:
+            break
+        }
+        return context
     }
 
-    private func executeApproved(_ request: IPCRequest) async throws -> JSONValue {
+    private func completionPlan(for request: IPCRequest) async throws -> CompletionPlan {
+        guard case .array(let entries)? = request.parameters["tasks"] else {
+            throw IPCStructuredError(code: "validation_error", message: "tasks must be an array of { taskId, expectedRevision }.")
+        }
+        let requests = try entries.map { entry in
+            (taskId: try requiredString(entry["taskId"], name: "taskId"),
+             expectedRevision: try requiredInt(entry["expectedRevision"], name: "expectedRevision"))
+        }
+        let items = try repository.planTaskCompletions(requests)
+        let status = try? await timerCommand(["command": "get_status", "confirmed": false])
+        let sessionSeconds = status?["config"]?["focusDurationSeconds"]?.intValue ?? 1500
+        let totalSeconds = items.reduce(0) { $0 + $1.remainingSessions } * sessionSeconds
+        let start = request.parameters["startedAt"] == nil
+            ? Date().addingTimeInterval(TimeInterval(-totalSeconds))
+            : try dateParam(request.parameters["startedAt"], name: "startedAt")
+        return CompletionPlan(items: items, sessionSeconds: sessionSeconds, start: start)
+    }
+
+    /// Timer command for a timer proposal. Preflight sends it as a dry run; execution sends it for real.
+    private func timerPayload(for request: IPCRequest) -> [String: Any]? {
+        let params = request.parameters
+        switch request.operation {
+        case "set_active_task":
+            return ["command": "set_active_task", "confirmed": true, "arguments": ["taskId": params["taskId"]?.stringValue as Any]]
+        case "begin_focus":
+            var arguments: [String: Any] = [:]
+            if let taskId = params["taskId"]?.stringValue { arguments["taskId"] = taskId }
+            if let title = params["title"]?.stringValue {
+                arguments["title"] = title
+                arguments["estimatedPomos"] = params["estimatedPomos"]?.intValue ?? 1
+                if let projectId = params["projectId"]?.stringValue { arguments["projectId"] = projectId }
+                if let tag = params["tag"]?.stringValue { arguments["tag"] = tag }
+            }
+            return ["command": "begin_focus", "confirmed": true, "arguments": arguments]
+        case "resume_focus":
+            return ["command": "resume_focus", "confirmed": true]
+        case "pause_focus":
+            return ["command": "pause_focus", "confirmed": true]
+        case "finish_focus":
+            return ["command": "finish_focus", "confirmed": true]
+        default:
+            return nil
+        }
+    }
+
+    private func preflight(_ request: IPCRequest, context: ProposalContext) async throws {
+        let params = request.parameters
+        if var payload = timerPayload(for: request) {
+            payload["dryRun"] = true
+            _ = try await timerCommand(payload)
+            if request.operation == "finish_focus", params["completeTask"]?.boolValue == true, context.activeTask?["id"] == nil {
+                throw IPCStructuredError(
+                    code: "validation_error",
+                    message: "No task is selected in Flumen, so finish_focus cannot complete one. Use complete_tasks to complete tasks."
+                )
+            }
+            return
+        }
+        switch request.operation {
+        case "create_task":
+            try repository.checkNewTask(
+                title: try requiredString(params["title"], name: "title"),
+                estimatedPomos: params["estimatedPomos"]?.intValue ?? 1,
+                projectId: params["projectId"]?.stringValue
+            )
+        case "update_task":
+            try repository.checkTask(
+                id: try requiredString(params["id"], name: "id"),
+                expectedRevision: try requiredInt(params["expectedRevision"], name: "expectedRevision")
+            )
+            try repository.checkNewTask(
+                title: try requiredString(params["title"], name: "title"),
+                estimatedPomos: try requiredInt(params["estimatedPomos"], name: "estimatedPomos"),
+                projectId: params["projectId"]?.stringValue
+            )
+        case "complete_task":
+            try repository.checkTask(
+                id: try requiredString(params["taskId"], name: "taskId"),
+                expectedRevision: try requiredInt(params["expectedRevision"], name: "expectedRevision"),
+                requiredStatus: 0
+            )
+        case "reopen_task":
+            try repository.checkTask(
+                id: try requiredString(params["taskId"], name: "taskId"),
+                expectedRevision: try requiredInt(params["expectedRevision"], name: "expectedRevision"),
+                requiredStatus: 1
+            )
+        case "correct_time_entry":
+            _ = try requiredString(params["reason"], name: "reason")
+            if let duration = params["durationSeconds"]?.intValue, !(1...86_400).contains(duration) {
+                throw IPCStructuredError(code: "validation_error", message: "durationSeconds must be between 1 and 86400.")
+            }
+            try repository.checkActivity(
+                id: try requiredString(params["id"], name: "id"),
+                expectedRevision: try requiredInt(params["expectedRevision"], name: "expectedRevision"),
+                projectId: params["projectId"]?.stringValue
+            )
+        case "log_time":
+            let duration = try requiredInt(params["durationSeconds"], name: "durationSeconds")
+            let startedAt = (try? dateParam(params["startedAt"], name: "startedAt")) ?? Date().addingTimeInterval(TimeInterval(-duration))
+            try repository.checkNewActivity(
+                duration: duration,
+                timestamp: startedAt,
+                taskId: params["taskId"]?.stringValue,
+                taskTitle: try requiredString(params["title"], name: "title"),
+                projectId: params["projectId"]?.stringValue,
+                sourceClient: request.client.name,
+                idempotencyKey: request.idempotencyKey
+            )
+        case "complete_tasks":
+            guard let plan = context.completion else { return }
+            if plan.end > Date().addingTimeInterval(120) {
+                throw IPCStructuredError(code: "validation_error", message: "Logged sessions cannot end in the future. Use an earlier startedAt.")
+            }
+            if plan.totalSeconds > 86_400 {
+                throw IPCStructuredError(code: "validation_error", message: "Logged sessions cannot exceed 24 hours in one request.")
+            }
+            if plan.totalSeconds > 0 {
+                try repository.checkNewActivity(
+                    duration: plan.totalSeconds,
+                    timestamp: plan.start,
+                    taskId: nil,
+                    taskTitle: nil,
+                    projectId: nil,
+                    sourceClient: nil,
+                    idempotencyKey: nil
+                )
+            }
+        default:
+            break
+        }
+    }
+
+    private func executeApproved(_ request: IPCRequest, completion: CompletionPlan?) async throws -> JSONValue {
         let params = request.parameters
         switch request.operation {
         case "log_time":
@@ -490,37 +650,12 @@ final class AgentAccessCoordinator: @unchecked Sendable {
             refreshShelf()
             return JSONValue.from(any: updated)
 
-        case "set_active_task":
-            return try await timerCommand([
-                "command": "set_active_task",
-                "confirmed": true,
-                "arguments": ["taskId": params["taskId"]?.stringValue as Any]
-            ])
-
-        case "begin_focus":
-            var arguments: [String: Any] = [:]
-            if let taskId = params["taskId"]?.stringValue { arguments["taskId"] = taskId }
-            if let title = params["title"]?.stringValue {
-                arguments["title"] = title
-                arguments["estimatedPomos"] = params["estimatedPomos"]?.intValue ?? 1
-                if let projectId = params["projectId"]?.stringValue { arguments["projectId"] = projectId }
-                if let tag = params["tag"]?.stringValue { arguments["tag"] = tag }
-            }
-            return try await timerCommand([
-                "command": "begin_focus",
-                "confirmed": true,
-                "arguments": arguments
-            ])
-
-        case "resume_focus":
-            return try await timerCommand(["command": "resume_focus", "confirmed": true])
-
-        case "pause_focus":
-            return try await timerCommand(["command": "pause_focus", "confirmed": true])
+        case "set_active_task", "begin_focus", "resume_focus", "pause_focus":
+            return try await timerCommand(timerPayload(for: request)!)
 
         case "finish_focus":
             guard params["completeTask"]?.boolValue == true else {
-                return try await timerCommand(["command": "finish_focus", "confirmed": true])
+                return try await timerCommand(timerPayload(for: request)!)
             }
             let status = try await timerCommand(["command": "get_status", "confirmed": false])
             let taskId = status["activeTask"]?["id"]?.stringValue
@@ -556,6 +691,20 @@ final class AgentAccessCoordinator: @unchecked Sendable {
             )
             refreshShelf()
             return JSONValue.from(any: updated)
+
+        case "complete_tasks":
+            guard let completion else {
+                throw IPCStructuredError(code: "internal_error", message: "The approved completion plan was missing.")
+            }
+            let result = try repository.completeTasksWithSessions(
+                completion.items,
+                sessionSeconds: completion.sessionSeconds,
+                start: completion.start,
+                sourceClient: request.client.name
+            )
+            refreshShelf()
+            refreshReports()
+            return JSONValue.from(any: result)
 
         case "reopen_task":
             let updated = try repository.reopenTask(
@@ -858,10 +1007,13 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         ])
     }
 
-    private func proposalSummary(for request: IPCRequest, activeTask: [String: Any]?) -> [String: Any] {
+    private func proposalSummary(for request: IPCRequest, context: ProposalContext) -> [String: Any] {
+        if let plan = context.completion {
+            return completionSummary(for: request, plan: plan)
+        }
         let operationTitle = humanTitle(for: request.operation)
         var taskInfo = taskSummary(for: request)
-        if taskInfo.isEmpty, let activeTask {
+        if taskInfo.isEmpty, let activeTask = context.activeTask {
             if let id = activeTask["id"] as? String { taskInfo["id"] = id }
             if let title = activeTask["title"] as? String { taskInfo["title"] = title }
         }
@@ -912,6 +1064,46 @@ final class AgentAccessCoordinator: @unchecked Sendable {
             reason: request.parameters["reason"]?.stringValue
         )
         summary["sideEffects"] = sideEffects(for: request, taskTitle: taskTitle)
+        return summary
+    }
+
+    private func completionSummary(for request: IPCRequest, plan: CompletionPlan) -> [String: Any] {
+        let client = request.client.name
+        let taskCount = plan.items.count
+        let minutes = max(1, plan.sessionSeconds / 60)
+        var summary: [String: Any] = [
+            "requestId": request.requestId,
+            "action": request.operation,
+            "actionTitle": humanTitle(for: request.operation),
+            "expiresAt": Date().addingTimeInterval(FlumenIPC.confirmationWindow).timeIntervalSince1970 * 1000,
+            "provenance": ["source": "agent", "origin": client],
+            "items": plan.items.map {
+                [
+                    "title": $0.title,
+                    "sessions": $0.remainingSessions,
+                    "durationSeconds": $0.remainingSessions * plan.sessionSeconds
+                ] as [String: Any]
+            }
+        ]
+        summary["title"] = taskCount == 1
+            ? truncated(plan.items[0].title, maxLength: 120)
+            : "Complete \(taskCount) tasks"
+
+        var segments = [client, "Complete \(taskCount) task\(taskCount == 1 ? "" : "s")"]
+        var effects = ["Marks \(taskCount == 1 ? "the task" : "\(taskCount) tasks") complete"]
+        if plan.sessionCount > 0 {
+            summary["durationSeconds"] = plan.totalSeconds
+            summary["startedAt"] = plan.start.timeIntervalSince1970 * 1000
+            summary["endedAt"] = plan.end.timeIntervalSince1970 * 1000
+            segments.append("\(plan.sessionCount) session\(plan.sessionCount == 1 ? "" : "s")")
+            segments.append(formatProposalDuration(plan.totalSeconds))
+            effects.append("Logs \(plan.sessionCount) focus session\(plan.sessionCount == 1 ? "" : "s") of \(minutes) min, back-to-back")
+            effects.append("Counts them as completed sessions, recorded as logged by \(client)")
+        } else {
+            effects.append("Logs no new time; session counts already match the estimates")
+        }
+        summary["summary"] = segments.joined(separator: " · ")
+        summary["sideEffects"] = effects
         return summary
     }
 
@@ -1029,6 +1221,7 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         case "pause_focus": return "Pause focus"
         case "finish_focus": return "Finish focus"
         case "complete_task": return "Complete task"
+        case "complete_tasks": return "Complete tasks"
         case "reopen_task": return "Reopen task"
         case "correct_time_entry": return "Correct time entry"
         default: return operation
@@ -1060,7 +1253,7 @@ final class AgentAccessCoordinator: @unchecked Sendable {
             }
             return effects
         case "complete_task":
-            return ["Marks the task complete"]
+            return ["Marks the task complete", "Does not log sessions or time; use complete_tasks for that"]
         case "reopen_task":
             return ["Moves the task back to the open Task Shelf"]
         case "correct_time_entry":

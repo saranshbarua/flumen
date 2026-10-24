@@ -64,6 +64,28 @@ describe('AgentProposalOverlay', () => {
     expect(screen.getByText('2 more waiting')).toBeTruthy();
   });
 
+  it('lists every task with its sessions in a batch completion', () => {
+    render(
+      <AgentProposalOverlay
+        proposal={{
+          requestId: 'batch',
+          action: 'complete_tasks',
+          actionTitle: 'Complete tasks',
+          title: 'Complete 2 tasks',
+          items: [
+            { title: 'Smoke-test build', sessions: 3, durationSeconds: 4500 },
+            { title: 'Already filled', sessions: 0, durationSeconds: 0 },
+          ],
+        }}
+        onApproving={vi.fn()}
+        onDismiss={vi.fn()}
+      />
+    );
+    expect(screen.getByText('Smoke-test build')).toBeTruthy();
+    expect(screen.getByText('3 sessions · 1h 15m')).toBeTruthy();
+    expect(screen.getByText('No time to log')).toBeTruthy();
+  });
+
   it('declines and dismisses immediately', () => {
     const onDismiss = vi.fn();
     render(<AgentProposalOverlay proposal={baseProposal} onApproving={vi.fn()} onDismiss={onDismiss} />);

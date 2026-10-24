@@ -215,6 +215,85 @@ final class AgentRepositoryTests: XCTestCase {
         XCTAssertNoThrow(try logManual(title: "After", at: start.addingTimeInterval(7_300), duration: 600))
     }
 
+    func testCompleteTasksFillsSessionsAndLogsBackToBack() throws {
+        try repository.addTask(id: "a", title: "Smoke-test build", tag: nil, projectId: nil, estimatedPomos: 3)
+        try repository.addTask(id: "b", title: "Draft notes", tag: nil, projectId: nil, estimatedPomos: 2)
+        try repository.incrementTaskPomos(id: "b")
+        let plan = try repository.planTaskCompletions([(taskId: "a", expectedRevision: 1), (taskId: "b", expectedRevision: 2)])
+        XCTAssertEqual(plan.map(\.remainingSessions), [3, 1])
+
+        let start = Date().addingTimeInterval(-4 * 1500)
+        let result = try repository.completeTasksWithSessions(plan, sessionSeconds: 1500, start: start, sourceClient: "cursor")
+
+        let tasks = try XCTUnwrap(result["tasks"] as? [[String: Any]])
+        XCTAssertEqual(tasks.map { $0["completedPomos"] as? Int }, [3, 2])
+        XCTAssertTrue(tasks.allSatisfy { $0["isCompleted"] as? Bool == true })
+
+        let sessions = try XCTUnwrap(result["sessions"] as? [[String: Any]])
+        XCTAssertEqual(sessions.count, 4)
+        XCTAssertTrue(sessions.allSatisfy {
+            $0["durationSeconds"] as? Int == 1500 && $0["isCompletion"] as? Bool == true
+                && $0["source"] as? String == "agent" && $0["sourceClient"] as? String == "cursor"
+        })
+        XCTAssertEqual(sessions.map { $0["taskId"] as? String }, ["a", "a", "a", "b"])
+        let formatter = ISO8601DateFormatter()
+        let starts = sessions.compactMap { ($0["timestamp"] as? String).flatMap(formatter.date(from:)) }
+        for (earlier, later) in zip(starts, starts.dropFirst()) {
+            XCTAssertEqual(later.timeIntervalSince(earlier), 1500, accuracy: 1)
+        }
+
+        let reports = try repository.reports()
+        XCTAssertEqual(reports["totalSessions"] as? Int, 4)
+        XCTAssertEqual(reports["totalFocusTime"] as? Int, 6000)
+    }
+
+    func testCompleteTasksRefusesOverlapAndChangesNothing() throws {
+        try repository.addTask(id: "a", title: "Task", tag: nil, projectId: nil, estimatedPomos: 2)
+        _ = try logManual(title: "Meeting", at: Date().addingTimeInterval(-1_200), duration: 600)
+        let plan = try repository.planTaskCompletions([(taskId: "a", expectedRevision: 1)])
+        XCTAssertThrowsError(try repository.completeTasksWithSessions(plan, sessionSeconds: 1500, start: Date().addingTimeInterval(-3_000), sourceClient: "cursor")) { error in
+            XCTAssertEqual((error as? IPCStructuredError)?.code, "activity_overlap")
+        }
+        XCTAssertThrowsError(try repository.checkNewActivity(duration: 3_000, timestamp: Date().addingTimeInterval(-3_000), taskId: nil, taskTitle: nil, projectId: nil, sourceClient: nil, idempotencyKey: nil))
+        let task = try XCTUnwrap(try repository.listTasks().first)
+        XCTAssertEqual(task["completedPomos"] as? Int, 0)
+        XCTAssertEqual(task["isCompleted"] as? Bool, false)
+    }
+
+    func testCompleteTasksDetectsChangeAfterApproval() throws {
+        try repository.addTask(id: "a", title: "Task", tag: nil, projectId: nil, estimatedPomos: 2)
+        let plan = try repository.planTaskCompletions([(taskId: "a", expectedRevision: 1)])
+        try repository.incrementTaskPomos(id: "a")
+        XCTAssertThrowsError(try repository.completeTasksWithSessions(plan, sessionSeconds: 1500, start: Date().addingTimeInterval(-3_000), sourceClient: "cursor")) { error in
+            XCTAssertEqual((error as? IPCStructuredError)?.code, "revision_conflict")
+        }
+    }
+
+    func testCompleteTasksRefusesFutureAndAlreadyCompleteWork() throws {
+        try repository.addTask(id: "a", title: "Task", tag: nil, projectId: nil, estimatedPomos: 1)
+        let plan = try repository.planTaskCompletions([(taskId: "a", expectedRevision: 1)])
+        XCTAssertThrowsError(try repository.completeTasksWithSessions(plan, sessionSeconds: 1500, start: Date(), sourceClient: "cursor")) { error in
+            XCTAssertEqual((error as? IPCStructuredError)?.code, "validation_error")
+        }
+        _ = try repository.completeTask(id: "a", expectedRevision: 1)
+        XCTAssertThrowsError(try repository.planTaskCompletions([(taskId: "a", expectedRevision: 2)])) { error in
+            XCTAssertEqual((error as? IPCStructuredError)?.code, "validation_error")
+        }
+        XCTAssertThrowsError(try repository.planTaskCompletions([(taskId: "a", expectedRevision: 2), (taskId: "a", expectedRevision: 2)]))
+    }
+
+    func testCheckTaskEnforcesRevisionAndStatus() throws {
+        try repository.addTask(id: "a", title: "Task", tag: nil, projectId: nil, estimatedPomos: 1)
+        XCTAssertNoThrow(try repository.checkTask(id: "a", expectedRevision: 1, requiredStatus: 0))
+        XCTAssertThrowsError(try repository.checkTask(id: "a", expectedRevision: 1, requiredStatus: 1))
+        XCTAssertThrowsError(try repository.checkTask(id: "a", expectedRevision: 9)) { error in
+            XCTAssertEqual((error as? IPCStructuredError)?.code, "revision_conflict")
+        }
+        XCTAssertThrowsError(try repository.checkTask(id: "missing", expectedRevision: 1)) { error in
+            XCTAssertEqual((error as? IPCStructuredError)?.code, "not_found")
+        }
+    }
+
     @discardableResult
     private func logManual(title: String, at timestamp: Date, duration: Int) throws -> [String: Any] {
         try repository.logActivity(
