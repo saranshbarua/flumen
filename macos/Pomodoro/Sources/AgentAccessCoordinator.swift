@@ -809,9 +809,18 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         lock.lock()
         let now = Date()
         let isNew = connections[client.id] == nil
-        if var existing = connections[client.id] {
-            existing.lastActivityAt = now
-            connections[client.id] = existing
+        var renamed = false
+        if let existing = connections[client.id] {
+            // The helper reports its own name until the agent's MCP handshake supplies the real one.
+            renamed = existing.name != client.name
+            connections[client.id] = ConnectedClient(
+                id: existing.id,
+                name: client.name,
+                version: client.version,
+                processID: client.processID ?? existing.processID,
+                connectedAt: existing.connectedAt,
+                lastActivityAt: now
+            )
         } else {
             connections[client.id] = ConnectedClient(
                 id: client.id,
@@ -824,7 +833,7 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         }
         let pruned = pruneStaleConnectionsLocked(now: now)
         lock.unlock()
-        if isNew || pruned {
+        if isNew || renamed || pruned {
             DispatchQueue.main.async { [weak self] in self?.pushConnectionStatus() }
         }
     }

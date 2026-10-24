@@ -4,6 +4,7 @@ import { theme } from './theme';
 import { NativeBridge } from '../services/nativeBridge';
 import pkg from '../../package.json';
 import AgentAccessView, { AgentAccessStatus } from './AgentAccessView';
+import { agentDisplayName } from './agentClientName';
 
 interface SettingsViewProps {
   onClose: () => void;
@@ -20,8 +21,8 @@ const SettingsView: React.FC<SettingsViewProps> = ({ onClose }) => {
     const handleSettings = (event: Event) => {
       const detail = (event as CustomEvent).detail;
       const settings = detail?.settings ?? detail ?? {};
+      // Readiness comes only from native connection status, which knows whether the socket is listening.
       if (settings.enabled === false) setAgentStatus('off');
-      else if (settings.enabled === true) setAgentStatus((current) => current === 'connected' ? current : 'ready');
     };
     const handleStatus = (event: Event) => {
       const detail = (event as CustomEvent).detail ?? {};
@@ -31,7 +32,7 @@ const SettingsView: React.FC<SettingsViewProps> = ({ onClose }) => {
       else if (detail.status === 'starting') setAgentStatus('starting');
       else if (active || detail.status === 'connected') {
         setAgentStatus('connected');
-        setConnectedAgent(active?.name ?? active?.clientName ?? 'Local MCP Client');
+        setConnectedAgent(agentDisplayName(active?.name ?? active?.clientName));
       } else if (detail.enabled === false || detail.status === 'off') setAgentStatus('off');
       else setAgentStatus('ready');
     };
@@ -80,53 +81,23 @@ const SettingsView: React.FC<SettingsViewProps> = ({ onClose }) => {
       : agentStatus === 'ready'
         ? 'Ready'
         : agentStatus === 'connected'
-          ? 'Connected'
-          : 'Needs Attention';
-  const agentSubtitle = agentStatus === 'off'
-    ? 'Connect agents to Flumen'
-    : agentStatus === 'connected'
-      ? `${connectedAgent || 'Agent'} connected locally`
-      : agentStatus === 'error'
-        ? 'Flumen could not start agent access'
-        : agentStatus === 'starting'
-          ? 'Preparing the local helper'
-          : 'Waiting for a local connection';
+          ? connectedAgent || 'Connected'
+          : 'Needs attention';
 
   const agentAccessSection = (
-    <section aria-labelledby="agent-access-heading" style={{ padding: '4px 0 8px' }}>
-      <div id="agent-access-heading" style={{ fontSize: '9px', fontWeight: 800, letterSpacing: '.12em', color: theme.colors.text.muted, marginBottom: '8px' }}>
-        AGENT ACCESS
-      </div>
-      <button
-        type="button"
-        onClick={() => setShowAgentAccess(true)}
-        aria-label={`Agent Access, ${agentStatusText}`}
-        style={agentAccessRowStyle}
-      >
-        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, textAlign: 'left', minWidth: 0 }}>
-          <span
-            aria-hidden
-            style={{
-              width: 8,
-              height: 8,
-              borderRadius: '50%',
-              marginTop: 5,
-              flexShrink: 0,
-              background: agentStatusColor,
-              boxShadow: 'inset 0 0 0 1px rgba(255,255,255,.12)',
-            }}
-          />
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0 }}>
-            <span style={{ fontSize: '0.86rem', fontWeight: 650, color: 'white' }}>Agent Access</span>
-            <span style={{ fontSize: '0.7rem', color: theme.colors.text.muted }}>{agentSubtitle}</span>
-          </div>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: agentStatus === 'error' ? '#FF6961' : theme.colors.text.secondary }}>
-          <span style={{ fontSize: '0.7rem', fontWeight: 650 }}>{agentStatusText}</span>
-          <span aria-hidden style={{ fontSize: 20, opacity: .55 }}>›</span>
-        </div>
-      </button>
-    </section>
+    <button
+      type="button"
+      onClick={() => setShowAgentAccess(true)}
+      aria-label={`Agent Access, ${agentStatusText}`}
+      style={agentAccessRowStyle}
+    >
+      <span style={{ fontSize: '0.85rem', fontWeight: 500, color: 'white' }}>Agent Access</span>
+      <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, color: agentStatus === 'error' ? '#FF6961' : theme.colors.text.secondary }}>
+        <span aria-hidden style={{ width: 7, height: 7, borderRadius: '50%', flexShrink: 0, background: agentStatusColor }} />
+        <span style={{ fontSize: '0.78rem', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{agentStatusText}</span>
+        <span aria-hidden style={{ fontSize: 18, lineHeight: 1, opacity: .45 }}>›</span>
+      </span>
+    </button>
   );
 
   if (showAgentAccess) {
@@ -291,7 +262,7 @@ const SettingsView: React.FC<SettingsViewProps> = ({ onClose }) => {
           </div>
         </div>
 
-        <div style={{ paddingTop: '12px', borderTop: '1px solid rgba(255, 255, 255, 0.05)' }}>
+        <div style={{ paddingTop: '16px', borderTop: '1px solid rgba(255, 255, 255, 0.05)' }}>
           {agentAccessSection}
         </div>
 
@@ -466,17 +437,16 @@ const miniAdjustButtonStyle: React.CSSProperties = {
 
 const agentAccessRowStyle: React.CSSProperties = {
   width: '100%',
-  minHeight: '56px',
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'space-between',
   gap: '12px',
-  padding: '10px 12px',
-  border: '1px solid rgba(255,255,255,.07)',
-  borderRadius: '13px',
-  background: 'rgba(255,255,255,.035)',
+  padding: '4px 0',
+  border: 'none',
+  background: 'transparent',
   cursor: 'pointer',
   fontFamily: theme.fonts.display,
+  textAlign: 'left',
 };
 
 const toggleButtonStyle = (enabled: boolean): React.CSSProperties => ({

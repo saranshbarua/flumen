@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { NativeBridge } from '../services/nativeBridge';
 import type { ProposalPhase } from './agentProposalQueue';
 import { theme } from './theme';
+import { agentDisplayName } from './agentClientName';
 
 export interface AgentProposal {
   requestId: string;
@@ -108,9 +109,12 @@ const AgentProposalOverlay: React.FC<AgentProposalOverlayProps> = ({
   const secondsLeft = expiresAt ? Math.max(0, Math.ceil((expiresAt - now) / 1000)) : 0;
 
   return (
-    <div role="presentation" style={backdropStyle}>
-      <div style={stackStyle}>
-        {queuedCount > 0 && <div aria-hidden style={peekStyle(queuedCount > 1)} />}
+    <div role="presentation" className="agent-sheet-backdrop" style={backdropStyle}>
+      <style>{sheetMotion}</style>
+      <div className="agent-sheet" style={stackStyle}>
+        {queuedCount > 1 && <div aria-hidden style={peekStyle(2)} />}
+        {queuedCount > 0 && <div aria-hidden style={peekStyle(1)} />}
+        <div style={shellStyle}>
         <section
           role="dialog"
           aria-modal="true"
@@ -132,7 +136,7 @@ const AgentProposalOverlay: React.FC<AgentProposalOverlayProps> = ({
           )}
 
           <div style={originStyle}>
-            {proposal.provenance?.origin || 'Agent'}
+            {agentDisplayName(proposal.provenance?.origin)}
             {queuedCount > 0 && <span style={visuallyHidden}>, {queuedCount} more waiting</span>}
           </div>
           <h2 id="proposal-title" style={titleStyle}>{proposal.actionTitle || proposal.title || proposal.action}</h2>
@@ -163,25 +167,42 @@ const AgentProposalOverlay: React.FC<AgentProposalOverlayProps> = ({
           {phase === 'failed' ? (
             <>
               <p role="alert" style={errorStyle}>{error}</p>
-              <button type="button" onClick={() => onDismiss(proposal.requestId)} style={{ ...primaryButtonStyle, marginTop: 16 }}>
+              <button type="button" className="agent-sheet-button" onClick={() => onDismiss(proposal.requestId)} style={{ ...primaryButtonStyle, marginTop: 18 }}>
                 Close
               </button>
             </>
           ) : (
             <div style={actionsStyle}>
-              <button type="button" onClick={decline} disabled={!reviewing} style={buttonState(secondaryButtonStyle, reviewing)}>
+              <button type="button" className="agent-sheet-button" onClick={decline} disabled={!reviewing} style={buttonState(secondaryButtonStyle, reviewing)}>
                 Decline
               </button>
-              <button type="button" onClick={approve} disabled={!reviewing} style={buttonState(primaryButtonStyle, reviewing)}>
+              <button type="button" className="agent-sheet-button" onClick={approve} disabled={!reviewing} style={buttonState(primaryButtonStyle, reviewing)}>
                 {phase === 'applying' ? 'Applying…' : 'Approve'}
               </button>
             </div>
           )}
         </section>
+        </div>
       </div>
     </div>
   );
 };
+
+const SPRING = 'cubic-bezier(0.32, 0.72, 0, 1)';
+
+const sheetMotion = `
+  @keyframes agentSheetIn { from { transform: translateY(28px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  @keyframes agentBackdropIn { from { opacity: 0; } to { opacity: 1; } }
+  .agent-sheet-backdrop { animation: agentBackdropIn 320ms ${SPRING} both; }
+  .agent-sheet { animation: agentSheetIn 560ms ${SPRING} both; }
+  .agent-sheet-button { transition: transform 260ms ${SPRING}, opacity 260ms ${SPRING}, background-color 260ms ${SPRING}; }
+  .agent-sheet-button:not(:disabled):active { transform: scale(0.97); }
+  .agent-sheet-button:focus-visible { outline: 2px solid ${theme.colors.focus.primary}; outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) {
+    .agent-sheet-backdrop, .agent-sheet { animation: none; }
+    .agent-sheet-button { transition: none; }
+  }
+`;
 
 const SessionPips: React.FC<{ count: number }> = ({ count }) => (
   <span aria-hidden style={pipRowStyle}>
@@ -193,20 +214,29 @@ const SessionPips: React.FC<{ count: number }> = ({ count }) => (
 const buttonState = (style: React.CSSProperties, enabled: boolean): React.CSSProperties =>
   enabled ? style : { ...style, opacity: 0.4, cursor: 'default' };
 
-const backdropStyle: React.CSSProperties = { position: 'absolute', inset: 0, zIndex: 5000, background: 'rgba(0,0,0,.7)', backdropFilter: 'blur(16px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 22, borderRadius: theme.radii.window };
-const stackStyle: React.CSSProperties = { position: 'relative', width: '100%', maxHeight: 'calc(100% - 12px)', display: 'flex' };
-const peekStyle = (deep: boolean): React.CSSProperties => ({
-  position: 'absolute', left: 12, right: 12, bottom: -8, height: 40, borderRadius: 20,
-  background: '#202020', border: '1px solid rgba(255,255,255,.08)',
-  boxShadow: deep ? '0 8px 0 -4px #161616' : 'none',
+// Geometry: the window corner is 28px. The sheet sits 8px in (shell radius 20) and the
+// core sits 5px inside the shell (radius 15), so every corner stays concentric.
+const SHEET_INSET = 8;
+const SHELL_PAD = 5;
+const SHELL_RADIUS = 28 - SHEET_INSET;
+const CORE_RADIUS = SHELL_RADIUS - SHELL_PAD;
+
+const backdropStyle: React.CSSProperties = { position: 'absolute', inset: 0, zIndex: 5000, background: 'linear-gradient(180deg, rgba(0,0,0,.35) 0%, rgba(0,0,0,.78) 55%)', backdropFilter: 'blur(14px)', display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', padding: SHEET_INSET, borderRadius: theme.radii.window };
+const stackStyle: React.CSSProperties = { position: 'relative', display: 'flex', flexDirection: 'column', maxHeight: '100%', paddingTop: 16 };
+const peekStyle = (depth: 1 | 2): React.CSSProperties => ({
+  position: 'absolute', top: 16 - depth * 7, left: depth * 14, right: depth * 14, height: 30,
+  borderRadius: `${SHELL_RADIUS - depth * 3}px ${SHELL_RADIUS - depth * 3}px 0 0`,
+  background: depth === 1 ? 'rgba(40,40,40,.92)' : 'rgba(28,28,28,.85)',
+  boxShadow: 'inset 0 1px 0 rgba(255,255,255,.07)',
 });
-const cardStyle: React.CSSProperties = { position: 'relative', width: '100%', maxHeight: '100%', overflowY: 'auto', boxSizing: 'border-box', padding: '22px 20px 18px', borderRadius: 22, background: '#1A1A1A', border: '1px solid rgba(255,255,255,.09)', boxShadow: '0 30px 80px rgba(0,0,0,.7)', color: theme.colors.text.primary, fontFamily: theme.fonts.display };
-const timeTrackStyle: React.CSSProperties = { position: 'absolute', top: 10, left: 20, right: 20, height: 2, overflow: 'hidden', borderRadius: 2, background: 'rgba(255,255,255,.06)' };
-const timeFillStyle: React.CSSProperties = { height: '100%', background: theme.colors.focus.primary, transformOrigin: 'left', transition: 'transform 1s linear' };
-const originStyle: React.CSSProperties = { color: theme.colors.text.muted, fontSize: 11, marginBottom: 6 };
-const titleStyle: React.CSSProperties = { fontFamily: theme.fonts.brand, fontSize: 21, fontWeight: 600, lineHeight: 1.15, letterSpacing: '-.02em', margin: 0 };
-const subjectStyle: React.CSSProperties = { margin: '6px 0 0', color: 'rgba(255,255,255,.78)', fontSize: 14, lineHeight: 1.35, overflowWrap: 'anywhere' };
-const metaStyle: React.CSSProperties = { margin: '8px 0 0', color: theme.colors.text.secondary, fontSize: 12, fontVariantNumeric: 'tabular-nums', whiteSpace: 'pre-wrap' };
+const shellStyle: React.CSSProperties = { position: 'relative', minHeight: 0, display: 'flex', padding: SHELL_PAD, borderRadius: SHELL_RADIUS, background: 'rgba(255,255,255,.045)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,.07), 0 40px 90px -20px rgba(0,0,0,.65)' };
+const cardStyle: React.CSSProperties = { position: 'relative', width: '100%', maxHeight: '100%', overflowY: 'auto', boxSizing: 'border-box', padding: '28px 18px 18px', borderRadius: CORE_RADIUS, background: '#161616', boxShadow: 'inset 0 1px 1px rgba(255,255,255,.08)', color: theme.colors.text.primary, fontFamily: theme.fonts.brand };
+const timeTrackStyle: React.CSSProperties = { position: 'absolute', top: 12, left: '50%', width: 36, marginLeft: -18, height: 3, overflow: 'hidden', borderRadius: 3, background: 'rgba(255,255,255,.08)' };
+const timeFillStyle: React.CSSProperties = { height: '100%', background: 'rgba(255,255,255,.55)', transformOrigin: 'left', transition: `transform 1s ${SPRING}` };
+const originStyle: React.CSSProperties = { color: theme.colors.text.muted, fontSize: 12, marginBottom: 8 };
+const titleStyle: React.CSSProperties = { fontFamily: theme.fonts.brand, fontSize: 24, fontWeight: 600, lineHeight: 1.1, letterSpacing: '-.025em', margin: 0 };
+const subjectStyle: React.CSSProperties = { margin: '8px 0 0', color: 'rgba(255,255,255,.78)', fontSize: 15, lineHeight: 1.35, overflowWrap: 'anywhere' };
+const metaStyle: React.CSSProperties = { margin: '10px 0 0', color: theme.colors.text.secondary, fontSize: 12.5, fontVariantNumeric: 'tabular-nums', whiteSpace: 'pre-wrap' };
 const reasonStyle: React.CSSProperties = { margin: '10px 0 0', color: 'rgba(255,255,255,.62)', fontSize: 12, lineHeight: 1.45, fontStyle: 'italic', overflowWrap: 'anywhere' };
 const itemListStyle: React.CSSProperties = { listStyle: 'none', margin: '14px 0 0', padding: 0, display: 'flex', flexDirection: 'column', borderTop: '1px solid rgba(255,255,255,.06)' };
 const itemRowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '9px 0', borderBottom: '1px solid rgba(255,255,255,.06)', fontSize: 12 };
@@ -216,9 +246,9 @@ const pipRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center'
 const pipStyle: React.CSSProperties = { width: 5, height: 5, borderRadius: '50%', background: 'white' };
 const notesStyle: React.CSSProperties = { listStyle: 'none', margin: '14px 0 0', padding: 0, display: 'flex', flexDirection: 'column', gap: 4, color: theme.colors.text.secondary, fontSize: 12, lineHeight: 1.4 };
 const errorStyle: React.CSSProperties = { margin: '16px 0 0', color: '#FF6961', fontSize: 12, lineHeight: 1.45 };
-const actionsStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 20 };
-const primaryButtonStyle: React.CSSProperties = { width: '100%', height: 40, marginTop: 0, border: 0, borderRadius: 12, background: 'white', color: '#0A0A0A', fontSize: 13, fontWeight: 600, cursor: 'pointer' };
-const secondaryButtonStyle: React.CSSProperties = { ...primaryButtonStyle, background: 'rgba(255,255,255,.07)', color: 'rgba(255,255,255,.8)' };
+const actionsStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 8, marginTop: 28 };
+const primaryButtonStyle: React.CSSProperties = { width: '100%', height: 44, marginTop: 0, border: 0, borderRadius: 999, background: '#F5F5F3', color: '#0A0A0A', fontFamily: theme.fonts.brand, fontSize: 14, fontWeight: 600, cursor: 'pointer' };
+const secondaryButtonStyle: React.CSSProperties = { ...primaryButtonStyle, background: 'rgba(255,255,255,.06)', color: 'rgba(255,255,255,.78)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,.06)' };
 const visuallyHidden: React.CSSProperties = { position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)', whiteSpace: 'nowrap' };
 
 export default AgentProposalOverlay;
