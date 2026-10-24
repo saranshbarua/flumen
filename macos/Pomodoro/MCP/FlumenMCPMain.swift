@@ -165,7 +165,7 @@ private func authorizationMessage(for error: Error) -> String {
 
 private func registerTools(on server: Server, proxy: FlumenIPCProxy) async {
     let tools: [Tool] = [
-        tool("get_server_status", "Return whether Flumen Agent Access is available, plus the readFocusData and allowProposals permissions and the confirmation window in seconds."),
+        tool("get_server_status", "Return whether Flumen Agent Access is available. approvalsRequired false means writes apply immediately and return autoApplied; true means each write waits for the person."),
         tool("get_focus_status", "Return the authoritative Flumen focus timer status."),
         tool("list_tasks", "List Flumen Task Shelf items.", [
             "includeCompleted": .object(["type": .string("boolean")]),
@@ -345,8 +345,9 @@ private func structuredErrorPayload(_ error: IPCStructuredError) -> String {
 }
 
 private func proposalDescription(_ summary: String) -> String {
-    "\(summary) Flumen checks the request first and returns an error immediately, with no confirmation, if it cannot apply. "
-        + "Otherwise it opens a confirmation in Flumen and waits up to \(Int(FlumenIPC.confirmationWindow)) seconds for the person to approve or decline. "
+    "\(summary) Flumen checks the request first and returns an error immediately if it cannot apply. "
+        + "When get_server_status reports approvalsRequired true, this waits up to \(Int(FlumenIPC.confirmationWindow)) seconds for approval. "
+        + "When approvalsRequired is false, it applies immediately and the result includes autoApplied. "
         + "Pass a fresh idempotencyKey per change; reusing a key with different arguments returns idempotency_conflict."
 }
 

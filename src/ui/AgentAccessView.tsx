@@ -316,8 +316,12 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
         {enabledAndHealthy && (
           <section style={rowSectionStyle}>
             <div style={{ minWidth: 0 }}>
-              <div style={rowTitleStyle}>Proposals</div>
-              <div style={helperStyle}>Agents can always read tasks and sessions. Changes need your approval.</div>
+              <div style={rowTitleStyle}>Approvals</div>
+              <div style={helperStyle}>
+                {settings.allowProposals
+                  ? 'Each change waits for you. Off applies it immediately.'
+                  : 'Changes apply immediately. Reading tasks and sessions is unchanged.'}
+              </div>
             </div>
             <button
               className="agent-control"

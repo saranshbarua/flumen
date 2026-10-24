@@ -72,6 +72,8 @@ describe('AgentAccessView', () => {
     emit('agentAccessSettings', { enabled: true });
     emit('agentConnectionStatus', { status: 'ready', enabled: true, connections: [] });
     expect(screen.queryByText(/CONNECT AN AGENT|PERMISSIONS|Read Focus Data|Required|For support or manual MCP setup/)).toBeNull();
+    expect(screen.getByText('Approvals')).toBeTruthy();
+    expect(screen.getByText('Each change waits for you. Off applies it immediately.')).toBeTruthy();
     expect(screen.getByText(/Paste into your agent’s MCP settings/)).toBeTruthy();
   });
 });

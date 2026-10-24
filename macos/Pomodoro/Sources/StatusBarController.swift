@@ -138,6 +138,20 @@ class StatusBarController {
         return .zero
     }
 
+    /// Shows a short confirmation in the menu bar, unless a countdown owns the title.
+    func flashTitle(_ title: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.nativeTimer == nil, let button = self.statusItem.button else { return }
+            let previous = button.title
+            button.title = title
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                if self?.statusItem.button?.title == title {
+                    self?.statusItem.button?.title = previous
+                }
+            }
+        }
+    }
+
     func updateTitle(_ title: String) {
         DispatchQueue.main.async { [weak self] in
             self?.statusItem.button?.title = title

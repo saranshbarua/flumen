@@ -288,14 +288,9 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         }
 
         if AgentOperationCatalog.isWrite(operation) {
-            guard current.allowProposals else {
-                throw IPCStructuredError(
-                    code: "permission_denied",
-                    message: "Agent proposals are turned off in Flumen. Enable them in Settings → Agent Access."
-                )
-            }
+            let approvals = current.allowProposals
             guard let key = request.idempotencyKey else {
-                return try await proposeAndExecute(request)
+                return try await performWrite(request, approvals: approvals)
             }
             let client = request.client.name
             let fingerprint = AgentRequestFingerprint.make(operation: operation, parameters: request.parameters)
@@ -307,7 +302,7 @@ final class AgentAccessCoordinator: @unchecked Sendable {
                 if let cached = try repository.cachedOperation(client: client, key: key, operation: operation, fingerprint: fingerprint) {
                     return cached
                 }
-                let result = try await proposeAndExecute(request)
+                let result = try await performWrite(request, approvals: approvals)
                 try? repository.storeOperation(client: client, key: key, operation: operation, fingerprint: fingerprint, result: result)
                 return result
             }
@@ -323,6 +318,7 @@ final class AgentAccessCoordinator: @unchecked Sendable {
             "agentAccessEnabled": .bool(current.enabled),
             "readFocusData": .bool(current.readFocusData),
             "allowProposals": .bool(current.allowProposals),
+            "approvalsRequired": .bool(current.allowProposals),
             "confirmationWindowSeconds": .number(FlumenIPC.confirmationWindow),
             "protocolVersion": .string(String(FlumenIPC.protocolVersion)),
             "helperPath": .string(helperPath())
@@ -395,6 +391,32 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         var sessionCount: Int { items.reduce(0) { $0 + $1.remainingSessions } }
         var totalSeconds: Int { sessionCount * sessionSeconds }
         var end: Date { start.addingTimeInterval(TimeInterval(totalSeconds)) }
+    }
+
+    /// Approvals on: show a card and wait. Approvals off: apply now and tell the agent it did.
+    private func performWrite(_ request: IPCRequest, approvals: Bool) async throws -> JSONValue {
+        if approvals { return try await proposeAndExecute(request) }
+        let context = try await buildContext(for: request)
+        try await preflight(request, context: context)
+        let result = try await mutationQueue.run { [self] in
+            try await self.executeApproved(request, completion: context.completion)
+        }
+        announceAutoApplied(request)
+        return withAutoApplied(result)
+    }
+
+    private func withAutoApplied(_ result: JSONValue) -> JSONValue {
+        var object = result.objectValue ?? ["value": result]
+        object["autoApplied"] = .bool(true)
+        return .object(object)
+    }
+
+    private func announceAutoApplied(_ request: IPCRequest) {
+        let title = humanTitle(for: request.operation)
+        DispatchQueue.main.async {
+            guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
+            appDelegate.statusBarController?.flashTitle(title)
+        }
     }
 
     private func proposeAndExecute(_ request: IPCRequest) async throws -> JSONValue {
