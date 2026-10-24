@@ -9,6 +9,8 @@ export interface AgentCommand {
   command?: string;
   name?: string;
   confirmed?: boolean;
+  /** Epoch ms after which native has already reported a timeout, so a mutation must not run. */
+  deadline?: number;
   arguments?: Record<string, unknown>;
   args?: Record<string, unknown>;
 }
@@ -84,6 +86,14 @@ export const executeAgentCommand = (
     );
   }
 
+  if (typeof input.deadline === 'number' && now > input.deadline) {
+    return fail(
+      requestId,
+      'command_expired',
+      'Flumen received this command after the agent stopped waiting, so nothing was changed.'
+    );
+  }
+
   const pomodoro = usePomodoroStore.getState();
   const taskStore = useTaskStore.getState();
 
@@ -102,6 +112,9 @@ export const executeAgentCommand = (
     case 'start_focus': {
       if (pomodoro.timer.status === 'running') {
         return fail(requestId, 'timer_already_running', 'A Flumen timer is already running.');
+      }
+      if (pomodoro.timer.status === 'paused') {
+        return fail(requestId, 'timer_paused', 'A focus session is paused. Use resume_focus to continue it.');
       }
       if (pomodoro.session.type !== 'focus') {
         return fail(requestId, 'not_focus_session', 'Finish or reset the current break before starting focus.');
@@ -139,6 +152,15 @@ export const executeAgentCommand = (
         data: { startedAt: now, activeTaskId: useTaskStore.getState().activeTaskId },
       };
     }
+
+    case 'resume':
+    case 'resume_timer':
+    case 'resume_focus':
+      if (pomodoro.timer.status !== 'paused') {
+        return fail(requestId, 'timer_not_paused', 'There is no paused timer to resume.');
+      }
+      pomodoro.startTimer(now);
+      return { ok: true, requestId, data: { resumedAt: now } };
 
     case 'pause':
     case 'pause_timer':

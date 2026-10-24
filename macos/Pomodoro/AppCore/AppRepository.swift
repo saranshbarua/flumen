@@ -144,12 +144,14 @@ public final class AppRepository: @unchecked Sendable {
                 }
             }
 
+            // Durations are capped at 24h, so only rows starting in the prior day can overlap.
+            // The lower bound keeps this an indexed range scan instead of a full-history filter.
             let overlaps = try Row.fetchAll(db, sql: """
                 SELECT * FROM session_logs
-                WHERE timestamp < ?
+                WHERE timestamp < ? AND timestamp > ?
                   AND DATETIME(timestamp, '+' || duration_seconds || ' seconds') > ?
                 LIMIT 10
-                """, arguments: [end, timestamp])
+                """, arguments: [end, timestamp.addingTimeInterval(-86_400), timestamp])
             if let exact = overlaps.first(where: {
                 let existingStart: Date = $0["timestamp"]
                 let existingDuration: Int = $0["duration_seconds"]
@@ -356,6 +358,27 @@ public final class AppRepository: @unchecked Sendable {
         }
     }
 
+    public func reopenTask(id: String, expectedRevision: Int) throws -> [String: Any] {
+        try database.dbPool.write { db in
+            guard let current = try Row.fetchOne(db, sql: "SELECT * FROM tasks WHERE id = ?", arguments: [id]) else {
+                throw notFound("task", id)
+            }
+            let revision: Int = current["revision"]
+            guard revision == expectedRevision else {
+                throw conflict("Task was changed after approval.", currentRevision: revision)
+            }
+            let status: Int = current["status"]
+            guard status == 1 else {
+                throw validation(status == 2 ? "Archived tasks cannot be reopened." : "Task is already open.")
+            }
+            try db.execute(sql: """
+                UPDATE tasks SET status = 0, is_completed = 0, revision = revision + 1, updated_at = ?
+                WHERE id = ? AND revision = ?
+                """, arguments: [Date(), id, revision])
+            return taskDictionary(try Row.fetchOne(db, sql: "SELECT * FROM tasks WHERE id = ?", arguments: [id])!)
+        }
+    }
+
     public func correctTimeEntry(
         id: String,
         expectedRevision: Int,
@@ -447,24 +470,31 @@ public final class AppRepository: @unchecked Sendable {
         }
     }
 
-    public func cachedOperation(client: String, key: String, operation: String) throws -> JSONValue? {
+    /// Returns the stored result for an idempotency key.
+    /// Throws `idempotency_conflict` when the key was first used with different parameters.
+    public func cachedOperation(client: String, key: String, operation: String, fingerprint: String) throws -> JSONValue? {
         try database.dbPool.read { db in
-            guard let json = try String.fetchOne(db, sql: """
-                SELECT response_json FROM agent_operation_results
+            guard let row = try Row.fetchOne(db, sql: """
+                SELECT response_json, request_fingerprint FROM agent_operation_results
                 WHERE source_client = ? AND idempotency_key = ? AND operation = ?
                 """, arguments: [client, key, operation]) else { return nil }
+            let storedFingerprint: String? = row["request_fingerprint"]
+            if let storedFingerprint, storedFingerprint != fingerprint {
+                throw AgentAccessErrors.idempotencyConflict()
+            }
+            let json: String = row["response_json"]
             return try JSONDecoder().decode(JSONValue.self, from: Data(json.utf8))
         }
     }
 
-    public func storeOperation(client: String, key: String, operation: String, result: JSONValue) throws {
+    public func storeOperation(client: String, key: String, operation: String, fingerprint: String, result: JSONValue) throws {
         let json = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
         try database.dbPool.write { db in
             try db.execute(sql: """
                 INSERT OR IGNORE INTO agent_operation_results
-                (source_client, idempotency_key, operation, response_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """, arguments: [client, key, operation, json, Date()])
+                (source_client, idempotency_key, operation, response_json, created_at, request_fingerprint)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """, arguments: [client, key, operation, json, Date(), fingerprint])
         }
     }
 }
@@ -589,7 +619,10 @@ private func calculateStreak(_ dates: [String]) -> Int {
     return streak
 }
 
-private func iso8601(_ date: Date) -> String { ISO8601DateFormatter().string(from: date) }
+// ISO8601DateFormatter is thread-safe; reuse one instead of allocating per row.
+nonisolated(unsafe) private let iso8601Formatter = ISO8601DateFormatter()
+
+private func iso8601(_ date: Date) -> String { iso8601Formatter.string(from: date) }
 
 private func validation(_ message: String) -> IPCStructuredError {
     IPCStructuredError(code: "validation_error", message: message)

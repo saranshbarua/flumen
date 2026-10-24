@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "test": "vitest",
     "test:native": "swift test --package-path macos/Pomodoro",
-    "test:mcp": "python3 scripts/mcp_stdio_smoke.py",
+    "test:mcp": "python3 scripts/mcp_stdio_smoke.py && python3 scripts/mcp_stdio_smoke.py --stub-app",
     "test:all": "npm test -- --run && npm run test:native && npm run test:mcp",
     "prepare": "husky",
     "release": "release-it",

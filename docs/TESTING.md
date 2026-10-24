@@ -54,7 +54,7 @@ The app includes a suite of automated unit and integration tests powered by **Vi
 ```bash
 npm test -- --run          # TypeScript / UI
 npm run test:native        # Swift package tests
-npm run test:mcp           # flumen-mcp protocol smoke (lists tools/resources; optional live call)
+npm run test:mcp           # flumen-mcp smoke: refusal (or live app) check, then a full handshake + write against a stub Flumen socket
 npm run test:all           # TypeScript + native + MCP smoke
 ```
 

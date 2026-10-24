@@ -94,4 +94,42 @@ describe('executeAgentCommand', () => {
     });
     expect(finished.ok).toBe(true);
   });
+
+  it('resumes a paused session and refuses begin_focus while paused', () => {
+    executeAgentCommand({ requestId: 'r7', command: 'begin_focus', confirmed: true, arguments: { title: 'Focus' } });
+    executeAgentCommand({ requestId: 'r8', command: 'pause_focus', confirmed: true });
+
+    const begin = executeAgentCommand({ requestId: 'r9', command: 'begin_focus', confirmed: true, arguments: { title: 'Other' } });
+    expect(begin.ok).toBe(false);
+    if (!begin.ok) expect(begin.error.code).toBe('timer_paused');
+    expect(useTaskStore.getState().tasks).toHaveLength(1);
+
+    const resumed = executeAgentCommand({ requestId: 'r10', command: 'resume_focus', confirmed: true });
+    expect(resumed.ok).toBe(true);
+    expect(usePomodoroStore.getState().timer.status).toBe('running');
+  });
+
+  it('refuses to resume when nothing is paused', () => {
+    const result = executeAgentCommand({ requestId: 'r11', command: 'resume_focus', confirmed: true });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe('timer_not_paused');
+  });
+
+  it('does not run a mutation that arrives after the native deadline', () => {
+    const now = 1_700_000_000_000;
+    const result = executeAgentCommand(
+      { requestId: 'r12', command: 'begin_focus', confirmed: true, deadline: now - 1, arguments: { title: 'Late' } },
+      now
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe('command_expired');
+    expect(usePomodoroStore.getState().timer.status).toBe('idle');
+    expect(useTaskStore.getState().tasks).toHaveLength(0);
+  });
+
+  it('still answers status reads after the deadline', () => {
+    const now = 1_700_000_000_000;
+    const result = executeAgentCommand({ requestId: 'r13', command: 'get_status', deadline: now - 1 }, now);
+    expect(result.ok).toBe(true);
+  });
 });

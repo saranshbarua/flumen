@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { usePomodoroStore } from '../state/pomodoroStore';
 import { useTaskStore } from '../state/taskStore';
 import { initPersistence } from '../services/persistence';
@@ -9,6 +9,15 @@ import SettingsView from './SettingsView';
 import ReportsView from './ReportsView';
 import TaskShelf from './TaskShelf';
 import AgentProposalOverlay, { AgentProposal } from './AgentProposalOverlay';
+import {
+  ProposalSettlement,
+  QueuedProposal,
+  dismissProposal,
+  enqueueProposal,
+  markApplying,
+  settleProposal,
+  syncPendingProposals,
+} from './agentProposalQueue';
 import { handleNativeAgentCommand } from '../services/agentCommandAdapter';
 import Tooltip, { FloatingTooltip } from './Tooltip';
 import { theme } from './theme';
@@ -109,7 +118,7 @@ const App: React.FC = () => {
   const [showSettings, setShowSettings] = useState(false);
   const [showReports, setShowReports] = useState(false);
   const [showTasks, setShowTasks] = useState(false);
-  const [agentProposal, setAgentProposal] = useState<AgentProposal | null>(null);
+  const [agentProposals, setAgentProposals] = useState<QueuedProposal[]>([]);
   const [isCelebrating, setIsCelebrating] = useState(false);
   const [isPinned, setIsPinned] = useState(false);
   const [dragHandleTooltip, setDragHandleTooltip] = useState<{ x: number; y: number } | null>(null);
@@ -204,18 +213,10 @@ const App: React.FC = () => {
       setDragHandleTooltip(null);
     };
 
-    const handleAgentProposal = (event: Event) => {
-      const detail = (event as CustomEvent).detail;
-      if (detail?.requestId) {
-        setAgentProposal(detail as AgentProposal);
-      }
-    };
-
     window.addEventListener('native:menuAction' as any, handleMenuAction);
     window.addEventListener('task-completed' as any, handleTaskCompletion);
     window.addEventListener('native:windowHidden' as any, handleWindowHidden);
     window.addEventListener('native:agentCommand' as any, handleNativeAgentCommand);
-    window.addEventListener('native:agentProposal' as any, handleAgentProposal);
     
     // Handle app activation to catch up on timer state
     const handleAppActivation = () => {
@@ -225,6 +226,7 @@ const App: React.FC = () => {
       } catch (error) {
         console.error('App: Error during activation tick:', error);
       }
+      NativeBridge.getPendingAgentProposals();
     };
     window.addEventListener('native:appDidBecomeActive' as any, handleAppActivation);
     
@@ -233,10 +235,47 @@ const App: React.FC = () => {
       window.removeEventListener('task-completed' as any, handleTaskCompletion);
       window.removeEventListener('native:windowHidden' as any, handleWindowHidden);
       window.removeEventListener('native:agentCommand' as any, handleNativeAgentCommand);
-      window.removeEventListener('native:agentProposal' as any, handleAgentProposal);
       window.removeEventListener('native:appDidBecomeActive' as any, handleAppActivation);
     };
   }, [timerStatus, startTimer, pauseTimer, skipTimer, resetTimer, config.soundEnabled, tick]);
+
+  // Agent proposals: native owns the pending set; this queue mirrors it and keeps
+  // approved cards on screen until native reports whether the write landed.
+  useEffect(() => {
+    const handleProposal = (event: Event) => {
+      const detail = (event as CustomEvent).detail as AgentProposal | undefined;
+      if (detail?.requestId) setAgentProposals((queue) => enqueueProposal(queue, detail));
+    };
+    const handlePending = (event: Event) => {
+      const proposals = (event as CustomEvent).detail?.proposals;
+      if (Array.isArray(proposals)) setAgentProposals((queue) => syncPendingProposals(queue, proposals));
+    };
+    const handleSettled = (event: Event) => {
+      const detail = (event as CustomEvent).detail as ProposalSettlement | undefined;
+      if (detail?.requestId) setAgentProposals((queue) => settleProposal(queue, detail));
+    };
+
+    window.addEventListener('native:agentProposal', handleProposal);
+    window.addEventListener('native:pendingAgentProposals', handlePending);
+    window.addEventListener('native:agentProposalSettled', handleSettled);
+    NativeBridge.getPendingAgentProposals();
+
+    return () => {
+      window.removeEventListener('native:agentProposal', handleProposal);
+      window.removeEventListener('native:pendingAgentProposals', handlePending);
+      window.removeEventListener('native:agentProposalSettled', handleSettled);
+    };
+  }, []);
+
+  const handleProposalApproving = useCallback((requestId: string) => {
+    setAgentProposals((queue) => markApplying(queue, requestId));
+  }, []);
+
+  const handleProposalDismiss = useCallback((requestId: string) => {
+    setAgentProposals((queue) => dismissProposal(queue, requestId));
+  }, []);
+
+  const visibleProposal = agentProposals[0];
 
   // Local keyboard shortcuts (Space for start/pause, Esc for hide, Cmd+Shift+P for pin)
   useEffect(() => {
@@ -665,12 +704,15 @@ const App: React.FC = () => {
       <TaskShelf isOpen={showTasks} onClose={handleCloseTasks} />
       {showSettings && <SettingsView onClose={() => setShowSettings(false)} />}
       {showReports && <ReportsView onClose={() => setShowReports(false)} />}
-      {agentProposal && (
+      {visibleProposal && (
         <AgentProposalOverlay
-          proposal={agentProposal}
-          onResolved={(requestId) => {
-            setAgentProposal((current) => current?.requestId === requestId ? null : current);
-          }}
+          key={visibleProposal.requestId}
+          proposal={visibleProposal}
+          phase={visibleProposal.phase}
+          error={visibleProposal.error}
+          queuedCount={agentProposals.length - 1}
+          onApproving={handleProposalApproving}
+          onDismiss={handleProposalDismiss}
         />
       )}
       {dragHandleTooltip && (

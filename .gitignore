@@ -35,6 +35,9 @@ Package.resolved
 *.swo
 .cursor/
 
+# --- Python ---
+__pycache__/
+
 # --- Vite / TypeScript ---
 *.tsbuildinfo
 marketing/

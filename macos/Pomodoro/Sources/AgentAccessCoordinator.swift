@@ -7,22 +7,24 @@ import FlumenCore
 final class AgentAccessCoordinator: @unchecked Sendable {
     static let shared = AgentAccessCoordinator()
 
+    /// A live helper heartbeats every 3s; three missed beats means it is gone.
+    private static let connectionIdleTimeout: TimeInterval = 10
+    private static let timerCommandTimeout: TimeInterval = 10
+    private static let selfTestClientID = "flumen-self-test"
+
     private let repository = AppRepository()
     private let settingsKey = "flumenAgentAccessSettings"
     private let lock = NSLock()
-    private let mutationGate = MutationGate()
+    private let mutationQueue = SerialMutationQueue()
+    private let proposals = ProposalRegistry()
+    private let inFlight = InFlightRequests()
     private var server: UnixSocketServer?
     private var settings = AgentAccessSettings()
     private var connections: [String: ConnectedClient] = [:]
-    private var pendingProposals: [String: PendingProposal] = [:]
+    private var revokedClientIds: Set<String> = []
     private var pendingTimerCommands: [String: CheckedContinuation<JSONValue, Error>] = [:]
+    private var connectionMonitor: DispatchSourceTimer?
     private weak var bridge: Bridge?
-
-    private actor MutationGate {
-        func run<T: Sendable>(_ work: @Sendable () async throws -> T) async rethrows -> T {
-            try await work()
-        }
-    }
 
     struct AgentAccessSettings: Codable, Equatable {
         var enabled = false
@@ -37,16 +39,9 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         let id: String
         let name: String
         let version: String?
+        let processID: Int32?
         let connectedAt: Date
         var lastActivityAt: Date
-    }
-
-    private struct PendingProposal {
-        let request: IPCRequest
-        let createdAt: Date
-        let expiresAt: Date
-        let continuation: CheckedContinuation<JSONValue, Error>
-        let summary: [String: Any]
     }
 
     private init() {
@@ -58,13 +53,24 @@ final class AgentAccessCoordinator: @unchecked Sendable {
 
     func attach(bridge: Bridge) {
         self.bridge = bridge
-        if settings.enabled {
-            do { try startServer() } catch {
-                print("AgentAccessCoordinator: Failed to restore listener: \(error)")
-            }
-        }
         pushSettings()
-        pushConnectionStatus()
+        if currentSettings().enabled {
+            do {
+                try startServer()
+                pushConnectionStatus()
+            } catch {
+                print("AgentAccessCoordinator: Failed to restore listener: \(error)")
+                pushConnectionStatus(status: "error", error: error.localizedDescription)
+            }
+        } else {
+            pushConnectionStatus()
+        }
+    }
+
+    private func currentSettings() -> AgentAccessSettings {
+        lock.lock()
+        defer { lock.unlock() }
+        return settings
     }
 
     // MARK: - Bridge-facing API
@@ -87,7 +93,7 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         case "retryAgentAccess":
             do {
                 try restartServerIfNeeded()
-                pushConnectionStatus(status: settings.enabled ? "ready" : "off")
+                pushConnectionStatus()
             } catch {
                 pushConnectionStatus(status: "error", error: error.localizedDescription)
             }
@@ -98,27 +104,15 @@ final class AgentAccessCoordinator: @unchecked Sendable {
             if let url = URL(string: link) {
                 NSWorkspace.shared.open(url)
             }
-            bridge?.sendToJS(action: "agentAccessActionResult", data: [
-                "action": "addToCursor",
-                "success": true,
-                "message": "Opened Cursor install link. The configuration was also copied."
-            ])
+            sendActionResult("addToCursor", success: true, message: "Opened Cursor install link. The configuration was also copied.")
             return true
         case "agentCopyConfiguration":
             copyToPasteboard(mcpConfigurationJSON())
-            bridge?.sendToJS(action: "agentAccessActionResult", data: [
-                "action": "copyConfiguration",
-                "success": true,
-                "message": "MCP configuration copied."
-            ])
+            sendActionResult("copyConfiguration", success: true, message: "MCP configuration copied.")
             return true
         case "agentCopyServerCommand":
             copyToPasteboard(helperPath())
-            bridge?.sendToJS(action: "agentAccessActionResult", data: [
-                "action": "copyServerCommand",
-                "success": true,
-                "message": "Server command copied."
-            ])
+            sendActionResult("copyServerCommand", success: true, message: "Server command copied.")
             return true
         case "agentOpenSetupGuide":
             if let url = URL(string: "https://github.com/saranshbarua/flumen/blob/main/docs/MCP-SETUP.md") {
@@ -127,30 +121,31 @@ final class AgentAccessCoordinator: @unchecked Sendable {
             return true
         case "agentTestConnection":
             pushConnectionDetails()
-            bridge?.sendToJS(action: "agentAccessActionResult", data: [
-                "action": "testConnection",
-                "success": settings.enabled && server != nil,
-                "message": settings.enabled
-                    ? "Agent Access is ready. Connect your MCP client using the copied configuration."
-                    : "Turn on Agent Access before testing."
-            ])
+            testConnection()
             return true
         case "agentDisconnectSessions":
-            disconnectSessions()
-            bridge?.sendToJS(action: "agentAccessActionResult", data: [
-                "action": "disconnectSessions",
-                "success": true,
-                "message": "Active agent sessions were cleared."
-            ])
+            let count = disconnectSessions()
+            sendActionResult(
+                "disconnectSessions",
+                success: true,
+                message: count == 0
+                    ? "No agent sessions were connected."
+                    : "Disconnected \(count) agent session\(count == 1 ? "" : "s"). Restart Flumen MCP in your agent to reconnect."
+            )
             return true
         case "getPendingAgentProposals":
-            let summaries = pendingProposals.values.map(\.summary)
-            bridge?.sendToJS(action: "pendingAgentProposals", data: ["proposals": summaries])
+            bridge?.sendToJS(action: "pendingAgentProposals", data: ["proposals": proposals.pending().map(\.summary)])
             return true
         case "agentProposalResult":
             guard let requestId = body["requestId"] as? String else { return true }
             let approved = body["approved"] as? Bool ?? false
-            resolveProposal(requestId: requestId, approved: approved, reason: body["reason"] as? String)
+            if !proposals.resolve(requestId: requestId, approved: approved, reason: body["reason"] as? String) {
+                settleProposalUI(
+                    requestId: requestId,
+                    outcome: "unavailable",
+                    message: "This request is no longer waiting. The agent may have stopped waiting, or Agent Access was turned off."
+                )
+            }
             return true
         case "agentCommandResult":
             guard let requestId = body["requestId"] as? String else { return true }
@@ -187,6 +182,9 @@ final class AgentAccessCoordinator: @unchecked Sendable {
                 failAllPending(code: "agent_access_disabled", message: "Agent Access was turned off.")
                 pushConnectionStatus(status: "off")
             } else if next.enabled {
+                if previous.allowProposals && !next.allowProposals {
+                    failAllPending(code: "permission_denied", message: "Agent proposals were turned off in Flumen.")
+                }
                 try restartServerIfNeeded()
                 pushConnectionStatus()
             }
@@ -197,7 +195,7 @@ final class AgentAccessCoordinator: @unchecked Sendable {
     }
 
     private func persistSettings() {
-        if let data = try? JSONEncoder().encode(settings) {
+        if let data = try? JSONEncoder().encode(currentSettings()) {
             UserDefaults.standard.set(data, forKey: settingsKey)
         }
     }
@@ -205,7 +203,15 @@ final class AgentAccessCoordinator: @unchecked Sendable {
     private func startServer() throws {
         stopServer()
         let path = FlumenSocketPath.current()
-        let server = UnixSocketServer(path: path) { [weak self] request in
+        let server = UnixSocketServer(
+            path: path,
+            onClientDisconnect: { [weak self] requestId in
+                self?.proposals.cancel(
+                    requestId: requestId,
+                    error: IPCStructuredError(code: "client_disconnected", message: "The agent stopped waiting for this confirmation.")
+                )
+            }
+        ) { [weak self] request in
             await self?.handle(request) ?? IPCResponse(
                 requestId: request.requestId,
                 error: IPCStructuredError(code: "internal_error", message: "Agent Access coordinator unavailable.")
@@ -213,25 +219,39 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         }
         try server.start()
         self.server = server
+        startConnectionMonitor()
     }
 
     private func restartServerIfNeeded() throws {
-        guard settings.enabled else { return }
+        guard currentSettings().enabled else { return }
         if server == nil { try startServer() }
     }
 
     private func stopServer() {
+        stopConnectionMonitor()
         server?.stop()
         server = nil
         lock.lock()
         connections.removeAll()
+        revokedClientIds.removeAll()
         lock.unlock()
     }
 
     // MARK: - IPC handling
 
     private func handle(_ request: IPCRequest) async -> IPCResponse {
-        touchConnection(request.client)
+        if isRevoked(request.client.id) {
+            return IPCResponse(
+                requestId: request.requestId,
+                error: IPCStructuredError(
+                    code: "session_disconnected",
+                    message: "Flumen disconnected this agent session. Restart Flumen MCP in your agent to reconnect."
+                )
+            )
+        }
+        if request.client.id != Self.selfTestClientID {
+            touchConnection(request.client)
+        }
         do {
             let result = try await dispatch(request)
             return IPCResponse(requestId: request.requestId, result: result)
@@ -246,7 +266,8 @@ final class AgentAccessCoordinator: @unchecked Sendable {
     }
 
     private func dispatch(_ request: IPCRequest) async throws -> JSONValue {
-        guard settings.enabled else {
+        let current = currentSettings()
+        guard current.enabled else {
             throw IPCStructuredError(
                 code: "agent_access_disabled",
                 message: "Agent Access is turned off in Flumen.",
@@ -254,50 +275,62 @@ final class AgentAccessCoordinator: @unchecked Sendable {
             )
         }
 
-        let readOps: Set<String> = [
-            "get_focus_status", "get_today_summary", "get_active_task", "get_server_status",
-            "list_tasks", "list_projects", "query_focus_activity",
-            "get_focus_summary", "get_estimation_context", "ping"
-        ]
-        let writeOps: Set<String> = [
-            "log_time", "create_task", "update_task", "set_active_task",
-            "begin_focus", "pause_focus", "finish_focus", "complete_task", "correct_time_entry"
-        ]
+        let operation = request.operation
+        if AgentOperationCatalog.session.contains(operation) {
+            return serverStatus(current)
+        }
 
-        if readOps.contains(request.operation) {
-            guard settings.readFocusData else {
+        if AgentOperationCatalog.reads.contains(operation) {
+            guard current.readFocusData else {
                 throw IPCStructuredError(code: "permission_denied", message: "Read Focus Data is disabled.")
             }
             return try await handleRead(request)
         }
 
-        if writeOps.contains(request.operation) {
-            guard settings.allowProposals else {
+        if AgentOperationCatalog.isWrite(operation) {
+            guard current.allowProposals else {
                 throw IPCStructuredError(
                     code: "permission_denied",
                     message: "Agent proposals are turned off in Flumen. Enable them in Settings → Agent Access."
                 )
             }
-            if let key = request.idempotencyKey,
-               let cached = try repository.cachedOperation(client: request.client.name, key: key, operation: request.operation) {
+            guard let key = request.idempotencyKey else {
+                return try await proposeAndExecute(request)
+            }
+            let client = request.client.name
+            let fingerprint = AgentRequestFingerprint.make(operation: operation, parameters: request.parameters)
+            if let cached = try repository.cachedOperation(client: client, key: key, operation: operation, fingerprint: fingerprint) {
                 return cached
             }
-            return try await proposeAndExecute(request)
+            let inFlightKey = [client, operation, key].joined(separator: "\u{1F}")
+            return try await inFlight.run(key: inFlightKey, fingerprint: fingerprint) {
+                if let cached = try repository.cachedOperation(client: client, key: key, operation: operation, fingerprint: fingerprint) {
+                    return cached
+                }
+                let result = try await proposeAndExecute(request)
+                try? repository.storeOperation(client: client, key: key, operation: operation, fingerprint: fingerprint, result: result)
+                return result
+            }
         }
 
-        throw IPCStructuredError(code: "unsupported_operation", message: "Unsupported operation: \(request.operation)")
+        throw IPCStructuredError(code: "unsupported_operation", message: "Unsupported operation: \(operation)")
+    }
+
+    private func serverStatus(_ current: AgentAccessSettings) -> JSONValue {
+        .object([
+            "ok": .bool(true),
+            "app": .string("Flumen"),
+            "agentAccessEnabled": .bool(current.enabled),
+            "readFocusData": .bool(current.readFocusData),
+            "allowProposals": .bool(current.allowProposals),
+            "confirmationWindowSeconds": .number(FlumenIPC.confirmationWindow),
+            "protocolVersion": .string(String(FlumenIPC.protocolVersion)),
+            "helperPath": .string(helperPath())
+        ])
     }
 
     private func handleRead(_ request: IPCRequest) async throws -> JSONValue {
         switch request.operation {
-        case "ping", "get_server_status":
-            return .object([
-                "ok": .bool(true),
-                "app": .string("Flumen"),
-                "agentAccessEnabled": .bool(settings.enabled),
-                "protocolVersion": .string(String(FlumenIPC.protocolVersion)),
-                "helperPath": .string(helperPath())
-            ])
         case "get_focus_status":
             return try await timerCommand(["command": "get_status", "confirmed": false])
         case "get_active_task":
@@ -326,6 +359,12 @@ final class AgentAccessCoordinator: @unchecked Sendable {
                 limit: request.parameters["limit"]?.intValue ?? 200
             )
             return .array(rows.map(JSONValue.from(any:)))
+        case "get_activity":
+            let id = try requiredString(request.parameters["id"], name: "id")
+            guard let activity = try repository.activity(byId: id) else {
+                throw IPCStructuredError(code: "not_found", message: "No activity exists with id \(id).")
+            }
+            return JSONValue.from(any: activity)
         case "get_focus_summary":
             let start = try dateParam(request.parameters["start"], name: "start")
             let end = try dateParam(request.parameters["end"], name: "end")
@@ -341,70 +380,64 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         }
     }
 
+    // MARK: - Proposals
+
     private func proposeAndExecute(_ request: IPCRequest) async throws -> JSONValue {
-        let summary = proposalSummary(for: request)
-        return try await withCheckedThrowingContinuation { continuation in
-            let expiresAt = Date().addingTimeInterval(120)
-            lock.lock()
-            pendingProposals[request.requestId] = PendingProposal(
-                request: request,
-                createdAt: Date(),
-                expiresAt: expiresAt,
-                continuation: continuation,
-                summary: summary
-            )
-            lock.unlock()
+        let requestId = request.requestId
+        let activeTask = await activeTaskForSummary(request)
+        let summary = proposalSummary(for: request, activeTask: activeTask)
+        proposals.register(requestId: requestId, summary: summary, window: FlumenIPC.confirmationWindow)
 
-            DispatchQueue.main.async { [weak self] in
-                self?.bridge?.sendToJS(action: "agentProposal", data: summary)
-                self?.notifyProposal(summary)
-                if let appDelegate = NSApp.delegate as? AppDelegate {
-                    appDelegate.statusBarController?.toggleWindow(nil)
-                }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.proposals.isPending(requestId) else { return }
+            self.bridge?.sendToJS(action: "agentProposal", data: summary)
+            self.notifyProposal(summary)
+            if let appDelegate = NSApp.delegate as? AppDelegate {
+                appDelegate.statusBarController?.revealWindow()
             }
+        }
 
-            DispatchQueue.global().asyncAfter(deadline: .now() + 120) { [weak self] in
-                self?.resolveProposal(requestId: request.requestId, approved: false, reason: "expired")
+        do {
+            try await proposals.waitForDecision(requestId: requestId)
+        } catch {
+            settleProposalUI(requestId: requestId, outcome: Self.outcome(for: error), message: error.localizedDescription)
+            throw error
+        }
+
+        do {
+            let result = try await mutationQueue.run { [self] in
+                try await self.executeApproved(request)
             }
+            settleProposalUI(requestId: requestId, outcome: "applied", message: nil)
+            return result
+        } catch {
+            settleProposalUI(requestId: requestId, outcome: "failed", message: error.localizedDescription)
+            throw error
         }
     }
 
-    private func resolveProposal(requestId: String, approved: Bool, reason: String?) {
-        lock.lock()
-        guard let pending = pendingProposals.removeValue(forKey: requestId) else {
-            lock.unlock()
-            return
+    private static func outcome(for error: Error) -> String {
+        switch (error as? IPCStructuredError)?.code {
+        case "user_declined": return "declined"
+        case "proposal_expired": return "expired"
+        default: return "cancelled"
         }
-        lock.unlock()
+    }
 
-        guard approved else {
-            pending.continuation.resume(throwing: IPCStructuredError(
-                code: reason == "expired" ? "proposal_expired" : "user_declined",
-                message: reason == "expired"
-                    ? "The Flumen confirmation expired before approval."
-                    : "The user declined the proposal in Flumen."
-            ))
-            return
+    /// Tells the window a proposal is finished so it never shows an approvable card for a closed request.
+    private func settleProposalUI(requestId: String, outcome: String, message: String?) {
+        DispatchQueue.main.async { [weak self] in
+            var data: [String: Any] = ["requestId": requestId, "outcome": outcome]
+            if let message { data["message"] = message }
+            self?.bridge?.sendToJS(action: "agentProposalSettled", data: data)
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["agent-proposal-\(requestId)"])
         }
+    }
 
-        Task {
-            do {
-                let result = try await mutationGate.run {
-                    try await self.executeApproved(pending.request)
-                }
-                if let key = pending.request.idempotencyKey {
-                    try? repository.storeOperation(
-                        client: pending.request.client.name,
-                        key: key,
-                        operation: pending.request.operation,
-                        result: result
-                    )
-                }
-                pending.continuation.resume(returning: result)
-            } catch {
-                pending.continuation.resume(throwing: error)
-            }
-        }
+    private func activeTaskForSummary(_ request: IPCRequest) async -> [String: Any]? {
+        guard request.operation == "finish_focus", request.parameters["completeTask"]?.boolValue == true else { return nil }
+        let status = try? await timerCommand(["command": "get_status", "confirmed": false])
+        return status?["activeTask"]?.anyValue as? [String: Any]
     }
 
     private func executeApproved(_ request: IPCRequest) async throws -> JSONValue {
@@ -479,32 +512,58 @@ final class AgentAccessCoordinator: @unchecked Sendable {
                 "arguments": arguments
             ])
 
+        case "resume_focus":
+            return try await timerCommand(["command": "resume_focus", "confirmed": true])
+
         case "pause_focus":
             return try await timerCommand(["command": "pause_focus", "confirmed": true])
 
         case "finish_focus":
-            let result = try await timerCommand(["command": "finish_focus", "confirmed": true])
-            if params["completeTask"]?.boolValue == true {
-                _ = try? await timerCommand(["command": "complete_task", "confirmed": true])
+            guard params["completeTask"]?.boolValue == true else {
+                return try await timerCommand(["command": "finish_focus", "confirmed": true])
             }
-            return result
+            let status = try await timerCommand(["command": "get_status", "confirmed": false])
+            let taskId = status["activeTask"]?["id"]?.stringValue
+            let finished = try await timerCommand(["command": "finish_focus", "confirmed": true])
+            guard let taskId else {
+                throw IPCStructuredError(
+                    code: "partial_failure",
+                    message: "Focus finished, but no task was selected, so no task was completed.",
+                    details: ["timerFinished": .bool(true), "taskCompleted": .bool(false)]
+                )
+            }
+            do {
+                let completion = try await timerCommand([
+                    "command": "complete_task",
+                    "confirmed": true,
+                    "arguments": ["taskId": taskId]
+                ])
+                var merged = finished.objectValue ?? [:]
+                merged["completedTask"] = completion
+                return .object(merged)
+            } catch {
+                throw IPCStructuredError(
+                    code: "partial_failure",
+                    message: "Focus finished, but Flumen could not complete the task: \(error.localizedDescription)",
+                    details: ["timerFinished": .bool(true), "taskCompleted": .bool(false), "taskId": .string(taskId)]
+                )
+            }
 
         case "complete_task":
-            if let revision = params["expectedRevision"]?.intValue {
-                let updated = try repository.completeTask(
-                    id: try requiredString(params["taskId"], name: "taskId"),
-                    expectedRevision: revision
-                )
-                refreshShelf()
-                return JSONValue.from(any: updated)
-            }
-            let result = try await timerCommand([
-                "command": "complete_task",
-                "confirmed": true,
-                "arguments": ["taskId": params["taskId"]?.stringValue as Any]
-            ])
+            let updated = try repository.completeTask(
+                id: try requiredString(params["taskId"], name: "taskId"),
+                expectedRevision: try requiredInt(params["expectedRevision"], name: "expectedRevision")
+            )
             refreshShelf()
-            return result
+            return JSONValue.from(any: updated)
+
+        case "reopen_task":
+            let updated = try repository.reopenTask(
+                id: try requiredString(params["taskId"], name: "taskId"),
+                expectedRevision: try requiredInt(params["expectedRevision"], name: "expectedRevision")
+            )
+            refreshShelf()
+            return JSONValue.from(any: updated)
 
         case "correct_time_entry":
             let updated = try repository.correctTimeEntry(
@@ -531,6 +590,9 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         let requestId = UUID().uuidString
         var command = payload
         command["requestId"] = requestId
+        // The web view refuses a mutating command after this deadline, so a late delivery
+        // cannot change the timer after the agent has already been told it timed out.
+        command["deadline"] = Date().addingTimeInterval(Self.timerCommandTimeout - 0.5).timeIntervalSince1970 * 1000
         return try await withCheckedThrowingContinuation { continuation in
             lock.lock()
             pendingTimerCommands[requestId] = continuation
@@ -538,7 +600,7 @@ final class AgentAccessCoordinator: @unchecked Sendable {
             DispatchQueue.main.async { [weak self] in
                 self?.bridge?.sendToJS(action: "agentCommand", data: command)
             }
-            DispatchQueue.global().asyncAfter(deadline: .now() + 10) { [weak self] in
+            DispatchQueue.global().asyncAfter(deadline: .now() + Self.timerCommandTimeout) { [weak self] in
                 self?.failTimerCommand(requestId: requestId, message: "Timed out waiting for Flumen timer state.")
             }
         }
@@ -576,26 +638,28 @@ final class AgentAccessCoordinator: @unchecked Sendable {
     }
 
     private func failAllPending(code: String, message: String) {
+        proposals.cancelAll(error: IPCStructuredError(code: code, message: message))
         lock.lock()
-        let proposals = pendingProposals
-        pendingProposals.removeAll()
         let timers = pendingTimerCommands
         pendingTimerCommands.removeAll()
         lock.unlock()
-        for proposal in proposals.values {
-            proposal.continuation.resume(throwing: IPCStructuredError(code: code, message: message))
-        }
         for continuation in timers.values {
             continuation.resume(throwing: IPCStructuredError(code: code, message: message))
         }
     }
 
-    // MARK: - UI updates
+    // MARK: - Connections
+
+    private func isRevoked(_ clientId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return revokedClientIds.contains(clientId)
+    }
 
     private func touchConnection(_ client: IPCClientMetadata) {
         lock.lock()
         let now = Date()
-        pruneStaleConnectionsLocked(now: now)
+        let isNew = connections[client.id] == nil
         if var existing = connections[client.id] {
             existing.lastActivityAt = now
             connections[client.id] = existing
@@ -604,35 +668,100 @@ final class AgentAccessCoordinator: @unchecked Sendable {
                 id: client.id,
                 name: client.name,
                 version: client.version,
+                processID: client.processID,
                 connectedAt: now,
                 lastActivityAt: now
             )
         }
-        let snapshot = Array(connections.values)
+        let pruned = pruneStaleConnectionsLocked(now: now)
         lock.unlock()
-        DispatchQueue.main.async { [weak self] in
-            self?.pushConnectionStatus(status: snapshot.isEmpty ? "ready" : "connected", connections: snapshot)
+        if isNew || pruned {
+            DispatchQueue.main.async { [weak self] in self?.pushConnectionStatus() }
         }
     }
 
-    private func pruneStaleConnectionsLocked(now: Date = Date()) {
+    /// Returns true when any connection was removed.
+    private func pruneStaleConnectionsLocked(now: Date = Date()) -> Bool {
+        let before = connections.count
         connections = connections.filter { _, client in
-            now.timeIntervalSince(client.lastActivityAt) < 90
+            if let pid = client.processID, pid > 0, kill(pid, 0) != 0, errno == ESRCH { return false }
+            return now.timeIntervalSince(client.lastActivityAt) < Self.connectionIdleTimeout
         }
+        return connections.count != before
     }
 
-    private func disconnectSessions() {
+    private func startConnectionMonitor() {
+        stopConnectionMonitor()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 3, repeating: 3)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let pruned = self.pruneStaleConnectionsLocked()
+            self.lock.unlock()
+            if pruned { self.pushConnectionStatus() }
+        }
+        timer.resume()
+        connectionMonitor = timer
+    }
+
+    private func stopConnectionMonitor() {
+        connectionMonitor?.cancel()
+        connectionMonitor = nil
+    }
+
+    /// Revokes every connected helper so its next heartbeat fails and it exits.
+    private func disconnectSessions() -> Int {
         lock.lock()
+        let ids = Set(connections.keys)
+        revokedClientIds.formUnion(ids)
         connections.removeAll()
         lock.unlock()
+        server?.disconnectClients()
         failAllPending(code: "session_disconnected", message: "Agent sessions were disconnected in Flumen.")
-        pushConnectionStatus(status: settings.enabled ? "ready" : "off")
+        pushConnectionStatus()
+        return ids.count
     }
+
+    private func testConnection() {
+        guard currentSettings().enabled else {
+            sendActionResult("testConnection", success: false, message: "Turn on Agent Access before testing.")
+            return
+        }
+        guard server != nil else {
+            sendActionResult("testConnection", success: false, message: "Agent Access is not running. Choose Try Again.")
+            return
+        }
+        let client = UnixSocketClient(
+            path: FlumenSocketPath.current(),
+            metadata: IPCClientMetadata(id: Self.selfTestClientID, name: "Flumen self-test"),
+            timeout: 3
+        )
+        Task {
+            let success: Bool
+            let message: String
+            do {
+                _ = try await client.send(operation: "ping")
+                success = true
+                message = "Agent Access is ready. The local helper socket answered."
+            } catch {
+                success = false
+                message = "Flumen could not reach its local socket: \(error.localizedDescription)"
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.sendActionResult("testConnection", success: success, message: message)
+            }
+        }
+    }
+
+    // MARK: - UI updates
 
     private func refreshShelf() {
         do {
             let data = try repository.loadInitialData()
-            bridge?.sendToJS(action: "db_initialData", data: data)
+            DispatchQueue.main.async { [weak self] in
+                self?.bridge?.sendToJS(action: "db_initialData", data: data)
+            }
         } catch {
             print("AgentAccessCoordinator: Failed to refresh shelf: \(error)")
         }
@@ -641,16 +770,25 @@ final class AgentAccessCoordinator: @unchecked Sendable {
     private func refreshReports() {
         do {
             let data = try repository.reports()
-            bridge?.sendToJS(action: "db_reportsData", data: data)
+            DispatchQueue.main.async { [weak self] in
+                self?.bridge?.sendToJS(action: "db_reportsData", data: data)
+            }
         } catch {
             print("AgentAccessCoordinator: Failed to refresh reports: \(error)")
         }
     }
 
+    private func sendActionResult(_ action: String, success: Bool, message: String) {
+        bridge?.sendToJS(action: "agentAccessActionResult", data: [
+            "action": action,
+            "success": success,
+            "message": message
+        ])
+    }
+
     private func notifyProposal(_ summary: [String: Any]) {
         let title = summary["title"] as? String ?? "Agent proposal"
         let body = summary["summary"] as? String ?? "An agent is waiting for confirmation in Flumen."
-        bridge?.sendToJS(action: "showNotification", data: ["title": title, "body": body])
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
@@ -664,30 +802,38 @@ final class AgentAccessCoordinator: @unchecked Sendable {
     }
 
     private func pushSettings() {
+        let current = currentSettings()
         bridge?.sendToJS(action: "agentAccessSettings", data: [
-            "enabled": settings.enabled,
-            "readFocusData": settings.readFocusData,
-            "allowProposals": settings.allowProposals,
-            "privacyAcknowledged": settings.privacyAcknowledged,
-            "consentVersion": settings.consentVersion,
-            "skipConsentPrompt": settings.skipConsentPrompt
+            "enabled": current.enabled,
+            "readFocusData": current.readFocusData,
+            "allowProposals": current.allowProposals,
+            "privacyAcknowledged": current.privacyAcknowledged,
+            "consentVersion": current.consentVersion,
+            "skipConsentPrompt": current.skipConsentPrompt
         ])
     }
 
-    private func pushConnectionStatus(status: String? = nil, error: String? = nil, connections override: [ConnectedClient]? = nil) {
+    private func pushConnectionStatus(status: String? = nil, error: String? = nil) {
         lock.lock()
-        let values = override ?? Array(connections.values)
+        let values = connections.values.sorted { $0.connectedAt < $1.connectedAt }
         let enabled = settings.enabled
         lock.unlock()
+        let listening = server != nil
+        var errorMessage = error
         let inferred: String
         if error != nil { inferred = "error" }
         else if !enabled { inferred = "off" }
+        else if !listening {
+            inferred = "error"
+            errorMessage = "Flumen could not start its local Agent Access socket."
+        }
         else if values.isEmpty { inferred = "ready" }
         else { inferred = "connected" }
+        let resolved = (status == "ready" && !listening && enabled) ? inferred : (status ?? inferred)
         bridge?.sendToJS(action: "agentConnectionStatus", data: [
-            "status": status ?? inferred,
+            "status": resolved,
             "enabled": enabled,
-            "error": error as Any,
+            "error": (resolved == "error" ? errorMessage : nil) as Any,
             "connections": values.map {
                 [
                     "id": $0.id,
@@ -708,19 +854,24 @@ final class AgentAccessCoordinator: @unchecked Sendable {
             "helperPath": helperPath(),
             "socketPath": FlumenSocketPath.current(),
             "protocolVersion": FlumenIPC.protocolVersion,
-            "enabled": settings.enabled
+            "enabled": currentSettings().enabled
         ])
     }
 
-    private func proposalSummary(for request: IPCRequest) -> [String: Any] {
+    private func proposalSummary(for request: IPCRequest, activeTask: [String: Any]?) -> [String: Any] {
         let operationTitle = humanTitle(for: request.operation)
-        let taskInfo = taskSummary(for: request)
+        var taskInfo = taskSummary(for: request)
+        if taskInfo.isEmpty, let activeTask {
+            if let id = activeTask["id"] as? String { taskInfo["id"] = id }
+            if let title = activeTask["title"] as? String { taskInfo["title"] = title }
+        }
         let resolvedProjectName = request.parameters["projectId"]?.stringValue.flatMap(projectName(for:))
 
         var summary: [String: Any] = [
             "requestId": request.requestId,
             "action": request.operation,
-            "expiresAt": Date().addingTimeInterval(120).timeIntervalSince1970 * 1000,
+            "actionTitle": operationTitle,
+            "expiresAt": Date().addingTimeInterval(FlumenIPC.confirmationWindow).timeIntervalSince1970 * 1000,
             "provenance": [
                 "source": "agent",
                 "origin": request.client.name
@@ -729,8 +880,13 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         if !taskInfo.isEmpty {
             summary["task"] = taskInfo
         }
-        if let duration = request.parameters["durationSeconds"]?.intValue {
+        let duration = request.parameters["durationSeconds"]?.intValue
+        if let duration {
             summary["durationSeconds"] = duration
+        }
+        if let interval = proposalInterval(for: request, duration: duration) {
+            summary["startedAt"] = interval.start.timeIntervalSince1970 * 1000
+            summary["endedAt"] = interval.end.timeIntervalSince1970 * 1000
         }
         if let projectId = request.parameters["projectId"]?.stringValue {
             if let resolvedProjectName {
@@ -738,6 +894,9 @@ final class AgentAccessCoordinator: @unchecked Sendable {
             } else {
                 summary["project"] = projectId
             }
+        }
+        if let reason = request.parameters["reason"]?.stringValue {
+            summary["reason"] = truncated(reason, maxLength: 240)
         }
         let taskTitle = taskInfo["title"] as? String
         summary["title"] = proposalNotificationTitle(
@@ -749,11 +908,26 @@ final class AgentAccessCoordinator: @unchecked Sendable {
             operation: request.operation,
             operationTitle: operationTitle,
             projectName: resolvedProjectName ?? taskInfo["projectName"] as? String,
-            durationSeconds: request.parameters["durationSeconds"]?.intValue,
+            durationSeconds: duration,
             reason: request.parameters["reason"]?.stringValue
         )
-        summary["sideEffects"] = sideEffects(for: request.operation)
+        summary["sideEffects"] = sideEffects(for: request, taskTitle: taskTitle)
         return summary
+    }
+
+    private func proposalInterval(for request: IPCRequest, duration: Int?) -> (start: Date, end: Date)? {
+        let startedAt = try? dateParam(request.parameters["startedAt"], name: "startedAt")
+        switch request.operation {
+        case "log_time":
+            guard let duration else { return nil }
+            let start = startedAt ?? Date().addingTimeInterval(TimeInterval(-duration))
+            return (start, start.addingTimeInterval(TimeInterval(duration)))
+        case "correct_time_entry":
+            guard let startedAt, let duration else { return nil }
+            return (startedAt, startedAt.addingTimeInterval(TimeInterval(duration)))
+        default:
+            return nil
+        }
     }
 
     private func taskSummary(for request: IPCRequest) -> [String: Any] {
@@ -792,7 +966,7 @@ final class AgentAccessCoordinator: @unchecked Sendable {
     }
 
     private func taskTitle(for id: String) -> String? {
-        guard let tasks = try? repository.listTasks(includeCompleted: true, limit: 500) else { return nil }
+        guard let tasks = try? repository.listTasks(includeCompleted: true, limit: 200) else { return nil }
         return tasks.first(where: { ($0["id"] as? String) == id })?["title"] as? String
     }
 
@@ -851,22 +1025,44 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         case "update_task": return "Update task"
         case "set_active_task": return "Set active task"
         case "begin_focus": return "Begin focus"
+        case "resume_focus": return "Resume focus"
         case "pause_focus": return "Pause focus"
         case "finish_focus": return "Finish focus"
         case "complete_task": return "Complete task"
+        case "reopen_task": return "Reopen task"
         case "correct_time_entry": return "Correct time entry"
         default: return operation
         }
     }
 
-    private func sideEffects(for operation: String) -> [String] {
-        switch operation {
+    private func sideEffects(for request: IPCRequest, taskTitle: String?) -> [String] {
+        switch request.operation {
         case "log_time":
             return ["Adds recorded focus time", "Does not count as a completed focus cycle"]
+        case "create_task":
+            return ["Adds a task to the Task Shelf"]
+        case "update_task":
+            return ["Changes the task title, project, or estimate"]
+        case "set_active_task":
+            return ["Selects the task without starting a timer"]
         case "begin_focus":
-            return ["Starts the Flumen focus timer"]
+            return request.parameters["title"]?.stringValue != nil && request.parameters["taskId"] == nil
+                ? ["Adds this task to the Task Shelf", "Starts the Flumen focus timer"]
+                : ["Starts the Flumen focus timer"]
+        case "resume_focus":
+            return ["Resumes the paused focus timer"]
+        case "pause_focus":
+            return ["Pauses the running focus timer"]
         case "finish_focus":
-            return ["Stops the active timer and advances the session"]
+            var effects = ["Stops the active timer and advances the session"]
+            if request.parameters["completeTask"]?.boolValue == true {
+                effects.append(taskTitle.map { "Marks “\(truncated($0, maxLength: 80))” complete" } ?? "Marks the active task complete")
+            }
+            return effects
+        case "complete_task":
+            return ["Marks the task complete"]
+        case "reopen_task":
+            return ["Moves the task back to the open Task Shelf"]
         case "correct_time_entry":
             return ["Updates a completed activity", "Keeps revision history"]
         default:
@@ -890,31 +1086,24 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         return "/Applications/Flumen.app/Contents/Helpers/flumen-mcp"
     }
 
-    private func mcpConfigurationJSON() -> String {
-        let config: [String: Any] = [
-            "mcpServers": [
-                "flumen": [
-                    "command": helperPath(),
-                    "args": [] as [String],
-                    "env": [
-                        "FLUMEN_BUNDLE_ID": Bundle.main.bundleIdentifier ?? "com.saranshbarua.flumen"
-                    ]
-                ]
-            ]
-        ]
-        let data = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
-        return data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-    }
-
-    private func cursorDeeplink() -> String {
-        let config: [String: Any] = [
+    private func mcpLaunchSpec() -> [String: Any] {
+        [
             "command": helperPath(),
             "args": [] as [String],
             "env": [
                 "FLUMEN_BUNDLE_ID": Bundle.main.bundleIdentifier ?? "com.saranshbarua.flumen"
             ]
         ]
-        let data = try! JSONSerialization.data(withJSONObject: config)
+    }
+
+    private func mcpConfigurationJSON() -> String {
+        let config: [String: Any] = ["mcpServers": ["flumen": mcpLaunchSpec()]]
+        let data = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
+        return data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    }
+
+    private func cursorDeeplink() -> String {
+        let data = (try? JSONSerialization.data(withJSONObject: mcpLaunchSpec())) ?? Data()
         let encoded = data.base64EncodedString()
         return "cursor://anysphere.cursor-deeplink/mcp/install?name=flumen&config=\(encoded)"
     }

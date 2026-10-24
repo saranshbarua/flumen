@@ -5,6 +5,30 @@ public enum FlumenIPC {
     public static let protocolVersion = 1
     public static let maximumMessageBytes = 1_048_576
     public static let defaultTimeout: TimeInterval = 15
+    /// How long a person has to approve or decline an agent proposal in Flumen.
+    public static let confirmationWindow: TimeInterval = 120
+    /// Write requests block on the confirmation, so the socket must outlive the confirmation window.
+    public static let mutationTimeout: TimeInterval = confirmationWindow + 15
+}
+
+/// Single source of truth for which IPC operations read data and which propose changes.
+public enum AgentOperationCatalog {
+    /// Session-level checks that expose no focus data and work even when Read Focus Data is off.
+    public static let session: Set<String> = ["ping", "get_server_status"]
+
+    public static let reads: Set<String> = [
+        "get_focus_status", "get_today_summary", "get_active_task",
+        "list_tasks", "list_projects", "query_focus_activity", "get_activity",
+        "get_focus_summary", "get_estimation_context"
+    ]
+
+    public static let writes: Set<String> = [
+        "log_time", "create_task", "update_task", "set_active_task",
+        "begin_focus", "resume_focus", "pause_focus", "finish_focus",
+        "complete_task", "reopen_task", "correct_time_entry"
+    ]
+
+    public static func isWrite(_ operation: String) -> Bool { writes.contains(operation) }
 }
 
 public enum JSONValue: Codable, Equatable, Sendable {

@@ -127,6 +127,10 @@ class StatusBarController {
         }
     }
     
+    func revealWindow() {
+        windowController.reveal(relativeTo: getAnchorRect())
+    }
+
     func getAnchorRect() -> NSRect {
         if let button = statusItem.button {
             return button.window?.convertToScreen(button.frame) ?? .zero

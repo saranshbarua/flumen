@@ -339,6 +339,17 @@ class WindowController: NSWindowController {
         bridge.sendToJS(action: "windowHidden", data: [:])
     }
     
+    /// Brings the window forward without hiding it when it is already open.
+    func reveal(relativeTo rect: NSRect) {
+        if panel.isVisible && panel.alphaValue > 0 {
+            panel.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            panel.alphaValue = 1.0
+            show(relativeTo: rect)
+        }
+    }
+
     func toggle(relativeTo rect: NSRect) {
         if panel.isVisible && panel.alphaValue > 0 {
             // If pinned, toggling should still hide the window

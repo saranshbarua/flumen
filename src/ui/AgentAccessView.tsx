@@ -53,14 +53,29 @@ const statusCopy: Record<AgentAccessStatus, { title: string; detail: string; col
   },
 };
 
-const normalizeSettings = (detail: any): Partial<AgentAccessSettings> =>
-  detail?.settings && typeof detail.settings === 'object' ? detail.settings : detail ?? {};
+type UnknownRecord = Record<string, unknown>;
 
-const normalizeConnections = (detail: any): AgentConnection[] => {
-  const raw = detail?.connections ?? detail?.activeConnections ?? detail?.clients ?? [];
+const isRecord = (value: unknown): value is UnknownRecord =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const SETTINGS_BOOLEAN_KEYS = ['enabled', 'readFocusData', 'allowProposals', 'privacyAcknowledged', 'skipConsentPrompt'] as const;
+
+export const normalizeSettings = (detail: unknown): Partial<AgentAccessSettings> => {
+  const source = isRecord(detail) && isRecord(detail.settings) ? detail.settings : detail;
+  if (!isRecord(source)) return {};
+  const next: Partial<AgentAccessSettings> = {};
+  for (const key of SETTINGS_BOOLEAN_KEYS) {
+    if (typeof source[key] === 'boolean') next[key] = source[key] as boolean;
+  }
+  if (typeof source.consentVersion === 'number') next.consentVersion = source.consentVersion;
+  return next;
+};
+
+const normalizeConnections = (detail: unknown): AgentConnection[] => {
+  const raw = isRecord(detail) ? detail.connections ?? detail.activeConnections ?? detail.clients ?? [] : [];
   if (!Array.isArray(raw)) return [];
   return raw
-    .filter((connection) => connection && connection.active !== false)
+    .filter((connection): connection is UnknownRecord => isRecord(connection) && connection.active !== false)
     .map((connection) => ({
       id: typeof connection.id === 'string' ? connection.id : undefined,
       name: typeof connection.name === 'string'
@@ -95,19 +110,21 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [details, setDetails] = useState<Record<string, unknown>>({});
   const [feedback, setFeedback] = useState('');
+  const [statusError, setStatusError] = useState('');
 
   useEffect(() => {
     const handleSettings = (event: Event) => {
       const next = normalizeSettings((event as CustomEvent).detail);
       setSettings((current) => ({ ...current, ...next }));
-      if (typeof next.enabled === 'boolean') {
-        setStatus((current) => next.enabled ? (current === 'connected' ? current : 'ready') : 'off');
-      }
+      // Readiness comes only from native connection status, which knows whether the socket is listening.
+      if (next.enabled === false) setStatus('off');
     };
     const handleStatus = (event: Event) => {
-      const payload = (event as CustomEvent).detail ?? {};
+      const detail = (event as CustomEvent).detail;
+      const payload: UnknownRecord = isRecord(detail) ? detail : {};
       const nextConnections = normalizeConnections(payload);
       setConnections(nextConnections);
+      setStatusError(typeof payload.error === 'string' ? payload.error : '');
       const rawStatus = String(payload.status ?? '').toLowerCase();
       if (rawStatus === 'error' || payload.error) setStatus('error');
       else if (rawStatus === 'starting') setStatus('starting');
@@ -117,11 +134,14 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
     };
     const handleDetails = (event: Event) => {
       const payload = (event as CustomEvent).detail;
-      setDetails(payload && typeof payload === 'object' ? payload : {});
+      setDetails(isRecord(payload) ? payload : {});
     };
     const handleAction = (event: Event) => {
-      const payload = (event as CustomEvent).detail ?? {};
-      setFeedback(String(payload.message ?? (payload.success === false ? 'Action failed. Show details and try again.' : 'Done.')));
+      const detail = (event as CustomEvent).detail;
+      const payload: UnknownRecord = isRecord(detail) ? detail : {};
+      setFeedback(typeof payload.message === 'string'
+        ? payload.message
+        : payload.success === false ? 'Action failed. Show details and try again.' : 'Done.');
     };
 
     window.addEventListener('native:agentAccessSettings', handleSettings);
@@ -227,7 +247,7 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
               <div aria-live="polite" style={{ color: 'white', fontSize: 15, fontWeight: 700 }}>
                 {status === 'connected' ? `${connectedName} connected` : copy.title}
               </div>
-              <div style={secondaryTextStyle}>{copy.detail}</div>
+              <div style={secondaryTextStyle}>{status === 'error' && statusError ? statusError : copy.detail}</div>
             </div>
           </div>
           <button
@@ -344,12 +364,7 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
                   ))}
                   <button
                     className="agent-control"
-                    onClick={() => {
-                      NativeBridge.disconnectAgentSessions();
-                      setConnections([]);
-                      setStatus('ready');
-                      setFeedback('Active agent sessions were cleared.');
-                    }}
+                    onClick={() => NativeBridge.disconnectAgentSessions()}
                     style={secondaryButtonStyle}
                   >
                     Disconnect Sessions

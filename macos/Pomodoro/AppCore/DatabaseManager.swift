@@ -137,6 +137,11 @@ public final class DatabaseManager: @unchecked Sendable {
                 WHERE external_reference IS NOT NULL
                 """)
         }
+        migrator.registerMigration("v6_agent_request_fingerprint") { db in
+            try db.alter(table: "agent_operation_results") { t in
+                t.add(column: "request_fingerprint", .text)
+            }
+        }
         return migrator
     }
 

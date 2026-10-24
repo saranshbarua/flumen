@@ -115,6 +115,11 @@ actor FlumenIPCProxy {
             operation: operation,
             parameters: parameters
         )
+        // Writes wait for a person to approve in Flumen. Keep the socket open for the whole
+        // confirmation window and never resend, or one tool call could open two proposals.
+        if AgentOperationCatalog.isWrite(operation) {
+            return try await client.send(request, timeout: FlumenIPC.mutationTimeout, retryAfterSend: false)
+        }
         return try await client.send(request)
     }
 }
@@ -144,6 +149,8 @@ private func authorizationMessage(for error: Error) -> String {
         switch error.code {
         case "agent_access_disabled":
             return "Agent Access is off in Flumen. Turn it on in Settings → Agent Access."
+        case "session_disconnected":
+            return "Flumen disconnected this agent session. Restart Flumen MCP in your agent to reconnect."
         case "app_unavailable", "ipc_failure", "connection_closed":
             return "Flumen is not available. Open Flumen on this Mac, turn on Agent Access, and try again."
         default:
@@ -158,7 +165,7 @@ private func authorizationMessage(for error: Error) -> String {
 
 private func registerTools(on server: Server, proxy: FlumenIPCProxy) async {
     let tools: [Tool] = [
-        tool("get_server_status", "Return whether Flumen Agent Access is available locally."),
+        tool("get_server_status", "Return whether Flumen Agent Access is available, plus the readFocusData and allowProposals permissions and the confirmation window in seconds."),
         tool("get_focus_status", "Return the authoritative Flumen focus timer status."),
         tool("list_tasks", "List Flumen Task Shelf items.", [
             "includeCompleted": .object(["type": .string("boolean")]),
@@ -173,6 +180,9 @@ private func registerTools(on server: Server, proxy: FlumenIPCProxy) async {
             "source": .object(["type": .string("string"), "description": .string("timer, manual, or agent")]),
             "limit": .object(["type": .string("integer")])
         ], required: ["start", "end"]),
+        tool("get_activity", "Return one focus activity by id, including its current revision for correct_time_entry.", [
+            "id": .object(["type": .string("string")])
+        ], required: ["id"]),
         tool("get_focus_summary", "Return aggregated focus totals for a date range.", [
             "start": .object(["type": .string("string")]),
             "end": .object(["type": .string("string")])
@@ -182,24 +192,26 @@ private func registerTools(on server: Server, proxy: FlumenIPCProxy) async {
             "projectId": .object(["type": .string("string")]),
             "limit": .object(["type": .string("integer")])
         ]),
-        tool("log_time", "Propose logging ad-hoc focus time. Requires Flumen confirmation.", [
+        tool("log_time", proposalDescription("Propose logging ad-hoc focus time."), [
             "title": .object(["type": .string("string")]),
             "durationSeconds": .object(["type": .string("integer")]),
-            "startedAt": .object(["type": .string("string")]),
+            "startedAt": .object(["type": .string("string"), "description": .string("ISO-8601 start. Defaults to now minus durationSeconds.")]),
             "taskId": .object(["type": .string("string")]),
             "projectId": .object(["type": .string("string")]),
+            "tag": .object(["type": .string("string")]),
+            "estimatedPomos": .object(["type": .string("integer")]),
             "durationOrigin": .object(["type": .string("string")]),
             "externalReference": .object(["type": .string("string")]),
             "idempotencyKey": .object(["type": .string("string")])
         ], required: ["title", "durationSeconds"]),
-        tool("create_task", "Propose creating a Flumen task. Requires confirmation.", [
+        tool("create_task", proposalDescription("Propose creating a Flumen task."), [
             "title": .object(["type": .string("string")]),
             "estimatedPomos": .object(["type": .string("integer")]),
             "projectId": .object(["type": .string("string")]),
             "tag": .object(["type": .string("string")]),
             "idempotencyKey": .object(["type": .string("string")])
         ], required: ["title"]),
-        tool("update_task", "Propose updating a task. Requires confirmation and expectedRevision.", [
+        tool("update_task", proposalDescription("Propose updating a task. Requires expectedRevision from list_tasks."), [
             "id": .object(["type": .string("string")]),
             "title": .object(["type": .string("string")]),
             "estimatedPomos": .object(["type": .string("integer")]),
@@ -208,11 +220,11 @@ private func registerTools(on server: Server, proxy: FlumenIPCProxy) async {
             "expectedRevision": .object(["type": .string("integer")]),
             "idempotencyKey": .object(["type": .string("string")])
         ], required: ["id", "title", "estimatedPomos", "expectedRevision"]),
-        tool("set_active_task", "Propose selecting an active task without starting a timer.", [
+        tool("set_active_task", proposalDescription("Propose selecting an open task without starting a timer."), [
             "taskId": .object(["type": .string("string")]),
             "idempotencyKey": .object(["type": .string("string")])
         ], required: ["taskId"]),
-        tool("begin_focus", "Propose starting a focus session, optionally creating/selecting a task.", [
+        tool("begin_focus", proposalDescription("Propose starting a new focus session, optionally creating or selecting a task. Fails while a session is paused; use resume_focus instead."), [
             "taskId": .object(["type": .string("string")]),
             "title": .object(["type": .string("string")]),
             "estimatedPomos": .object(["type": .string("integer")]),
@@ -220,19 +232,27 @@ private func registerTools(on server: Server, proxy: FlumenIPCProxy) async {
             "tag": .object(["type": .string("string")]),
             "idempotencyKey": .object(["type": .string("string")])
         ]),
-        tool("pause_focus", "Propose pausing the running focus timer.", [
+        tool("resume_focus", proposalDescription("Propose resuming the paused focus timer."), [
             "idempotencyKey": .object(["type": .string("string")])
         ]),
-        tool("finish_focus", "Propose finishing the active focus timer.", [
+        tool("pause_focus", proposalDescription("Propose pausing the running focus timer."), [
+            "idempotencyKey": .object(["type": .string("string")])
+        ]),
+        tool("finish_focus", proposalDescription("Propose finishing the active focus timer. With completeTask, the selected task is also marked complete and the confirmation says so."), [
             "completeTask": .object(["type": .string("boolean")]),
             "idempotencyKey": .object(["type": .string("string")])
         ]),
-        tool("complete_task", "Propose completing a Flumen task.", [
+        tool("complete_task", proposalDescription("Propose completing a Flumen task. Requires expectedRevision from list_tasks."), [
             "taskId": .object(["type": .string("string")]),
             "expectedRevision": .object(["type": .string("integer")]),
             "idempotencyKey": .object(["type": .string("string")])
-        ], required: ["taskId"]),
-        tool("correct_time_entry", "Propose correcting a completed activity entry.", [
+        ], required: ["taskId", "expectedRevision"]),
+        tool("reopen_task", proposalDescription("Propose moving a completed task back to the open Task Shelf. Requires expectedRevision from list_tasks with includeCompleted."), [
+            "taskId": .object(["type": .string("string")]),
+            "expectedRevision": .object(["type": .string("integer")]),
+            "idempotencyKey": .object(["type": .string("string")])
+        ], required: ["taskId", "expectedRevision"]),
+        tool("correct_time_entry", proposalDescription("Propose correcting a completed activity entry. Read expectedRevision with get_activity."), [
             "id": .object(["type": .string("string")]),
             "expectedRevision": .object(["type": .string("integer")]),
             "durationSeconds": .object(["type": .string("integer")]),
@@ -270,22 +290,20 @@ private func registerTools(on server: Server, proxy: FlumenIPCProxy) async {
             if shouldExitAfterAccessLoss(error) {
                 scheduleHelperExit(message: authorizationMessage(for: error))
             }
-            let payload = (try? encodeJSON(.object([
-                "code": .string(error.code),
-                "message": .string(error.message),
-                "retryable": .bool(error.retryable),
-                "details": error.details.map { .object($0) } ?? .null
-            ]))) ?? error.message
             return .init(
-                content: [.text(text: payload, annotations: nil, _meta: nil)],
+                content: [.text(text: structuredErrorPayload(error), annotations: nil, _meta: nil)],
                 isError: true
             )
         } catch let error as MCPError {
             scheduleHelperExit(message: authorizationMessage(for: error))
             throw error
+        } catch let error as CancellationError {
+            // The agent cancelled the call; the SDK drops the response per the MCP spec.
+            throw error
         } catch {
+            let wrapped = IPCStructuredError(code: "internal_error", message: error.localizedDescription)
             return .init(
-                content: [.text(text: error.localizedDescription, annotations: nil, _meta: nil)],
+                content: [.text(text: structuredErrorPayload(wrapped), annotations: nil, _meta: nil)],
                 isError: true
             )
         }
@@ -293,7 +311,22 @@ private func registerTools(on server: Server, proxy: FlumenIPCProxy) async {
 }
 
 private func shouldExitAfterAccessLoss(_ error: IPCStructuredError) -> Bool {
-    ["agent_access_disabled", "app_unavailable", "ipc_failure", "connection_closed"].contains(error.code)
+    ["agent_access_disabled", "session_disconnected", "app_unavailable", "ipc_failure", "connection_closed"].contains(error.code)
+}
+
+/// The one JSON error shape agents can rely on from tools and resources.
+private func structuredErrorPayload(_ error: IPCStructuredError) -> String {
+    (try? encodeJSON(.object([
+        "code": .string(error.code),
+        "message": .string(error.message),
+        "retryable": .bool(error.retryable),
+        "details": error.details.map { .object($0) } ?? .null
+    ]))) ?? error.message
+}
+
+private func proposalDescription(_ summary: String) -> String {
+    "\(summary) Opens a confirmation in Flumen and waits up to \(Int(FlumenIPC.confirmationWindow)) seconds for the person to approve or decline. "
+        + "Pass a fresh idempotencyKey per change; reusing a key with different arguments returns idempotency_conflict."
 }
 
 private func scheduleHelperExit(message: String) {
@@ -339,7 +372,7 @@ private func registerResources(on server: Server, proxy: FlumenIPCProxy) async {
             if shouldExitAfterAccessLoss(error) {
                 scheduleHelperExit(message: authorizationMessage(for: error))
             }
-            throw MCPError.invalidRequest(error.message)
+            throw MCPError.serverError(code: -32000, message: structuredErrorPayload(error))
         }
     }
 }
