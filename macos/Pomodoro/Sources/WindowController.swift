@@ -340,10 +340,11 @@ class WindowController: NSWindowController {
     }
     
     /// Brings the window forward without hiding it when it is already open.
+    /// An already-visible window is raised without activating Flumen, so keyboard focus stays in the
+    /// app the person is typing in; clicking the pinned panel activates it as usual.
     func reveal(relativeTo rect: NSRect) {
         if panel.isVisible && panel.alphaValue > 0 {
-            panel.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            panel.orderFrontRegardless()
         } else {
             panel.alphaValue = 1.0
             show(relativeTo: rect)
