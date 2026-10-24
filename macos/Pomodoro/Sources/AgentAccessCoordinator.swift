@@ -1090,17 +1090,14 @@ final class AgentAccessCoordinator: @unchecked Sendable {
             : "Complete \(taskCount) tasks"
 
         var segments = [client, "Complete \(taskCount) task\(taskCount == 1 ? "" : "s")"]
-        var effects = ["Marks \(taskCount == 1 ? "the task" : "\(taskCount) tasks") complete"]
+        var effects: [String] = []
         if plan.sessionCount > 0 {
             summary["durationSeconds"] = plan.totalSeconds
             summary["startedAt"] = plan.start.timeIntervalSince1970 * 1000
             summary["endedAt"] = plan.end.timeIntervalSince1970 * 1000
             segments.append("\(plan.sessionCount) session\(plan.sessionCount == 1 ? "" : "s")")
             segments.append(formatProposalDuration(plan.totalSeconds))
-            effects.append("Logs \(plan.sessionCount) focus session\(plan.sessionCount == 1 ? "" : "s") of \(minutes) min, back-to-back")
-            effects.append("Counts them as completed sessions, recorded as logged by \(client)")
-        } else {
-            effects.append("Logs no new time; session counts already match the estimates")
+            effects.append("Logged as \(minutes)-minute sessions by \(client)")
         }
         summary["summary"] = segments.joined(separator: " · ")
         summary["sideEffects"] = effects
@@ -1228,38 +1225,24 @@ final class AgentAccessCoordinator: @unchecked Sendable {
         }
     }
 
+    /// Consequences the heading does not already say. Restating the action adds noise, so most are empty.
     private func sideEffects(for request: IPCRequest, taskTitle: String?) -> [String] {
         switch request.operation {
         case "log_time":
-            return ["Adds recorded focus time", "Does not count as a completed focus cycle"]
-        case "create_task":
-            return ["Adds a task to the Task Shelf"]
-        case "update_task":
-            return ["Changes the task title, project, or estimate"]
-        case "set_active_task":
-            return ["Selects the task without starting a timer"]
+            return ["Not counted as a completed session"]
         case "begin_focus":
             return request.parameters["title"]?.stringValue != nil && request.parameters["taskId"] == nil
-                ? ["Adds this task to the Task Shelf", "Starts the Flumen focus timer"]
-                : ["Starts the Flumen focus timer"]
-        case "resume_focus":
-            return ["Resumes the paused focus timer"]
-        case "pause_focus":
-            return ["Pauses the running focus timer"]
+                ? ["Adds this task to your shelf"]
+                : []
         case "finish_focus":
-            var effects = ["Stops the active timer and advances the session"]
-            if request.parameters["completeTask"]?.boolValue == true {
-                effects.append(taskTitle.map { "Marks “\(truncated($0, maxLength: 80))” complete" } ?? "Marks the active task complete")
-            }
-            return effects
+            guard request.parameters["completeTask"]?.boolValue == true else { return [] }
+            return [taskTitle.map { "Also marks “\(truncated($0, maxLength: 80))” complete" } ?? "Also marks the current task complete"]
         case "complete_task":
-            return ["Marks the task complete", "Does not log sessions or time; use complete_tasks for that"]
-        case "reopen_task":
-            return ["Moves the task back to the open Task Shelf"]
+            return ["No time is logged"]
         case "correct_time_entry":
-            return ["Updates a completed activity", "Keeps revision history"]
+            return ["The previous values stay in history"]
         default:
-            return ["Requires your confirmation before changing Flumen"]
+            return []
         }
     }
 

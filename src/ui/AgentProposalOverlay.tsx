@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { NativeBridge } from '../services/nativeBridge';
 import type { ProposalPhase } from './agentProposalQueue';
 import { theme } from './theme';
@@ -36,10 +36,14 @@ interface AgentProposalOverlayProps {
   onDismiss: (requestId: string) => void;
 }
 
+const MAX_PIPS = 12;
+
 const formatDuration = (seconds?: number) => {
   if (!seconds || seconds < 1) return null;
   const minutes = Math.round(seconds / 60);
-  return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  if (minutes < 60) return `${minutes} min`;
+  const rest = minutes % 60;
+  return rest ? `${Math.floor(minutes / 60)}h ${rest}m` : `${minutes / 60}h`;
 };
 
 const formatTime = (value?: number) =>
@@ -48,8 +52,7 @@ const formatTime = (value?: number) =>
 const formatDay = (value?: number) => {
   if (!value) return null;
   const date = new Date(value);
-  const today = new Date();
-  if (date.toDateString() === today.toDateString()) return null;
+  if (date.toDateString() === new Date().toDateString()) return null;
   return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 };
 
@@ -62,6 +65,7 @@ const AgentProposalOverlay: React.FC<AgentProposalOverlayProps> = ({
   onDismiss,
 }) => {
   const [now, setNow] = useState(Date.now());
+  const [windowMs] = useState(() => (proposal.expiresAt ? Math.max(1, proposal.expiresAt - Date.now()) : 0));
   const expiresAt = proposal.expiresAt;
   const reviewing = phase === 'review';
   const expired = reviewing && Boolean(expiresAt && expiresAt <= now);
@@ -78,11 +82,6 @@ const AgentProposalOverlay: React.FC<AgentProposalOverlayProps> = ({
     onDismiss(proposal.requestId);
   }, [expired, onDismiss, proposal.requestId]);
 
-  const sideEffects = useMemo(() => {
-    if (Array.isArray(proposal.sideEffects)) return proposal.sideEffects;
-    return proposal.sideEffects ? [proposal.sideEffects] : [];
-  }, [proposal.sideEffects]);
-
   const approve = () => {
     NativeBridge.agentProposalResult(proposal.requestId, true);
     onApproving(proposal.requestId);
@@ -95,125 +94,131 @@ const AgentProposalOverlay: React.FC<AgentProposalOverlayProps> = ({
 
   if (expired) return null;
 
-  const duration = formatDuration(proposal.durationSeconds);
   const start = formatTime(proposal.startedAt);
   const end = formatTime(proposal.endedAt);
   const day = formatDay(proposal.startedAt);
   const interval = start && end ? `${day ? `${day}, ` : ''}${start}–${end}` : null;
-  const time = [interval, duration].filter(Boolean).join(' · ') || null;
   const project = typeof proposal.project === 'string' ? proposal.project : proposal.project?.name;
-  const actionLabel = proposal.actionTitle || proposal.action;
+  const meta = [project, interval, formatDuration(proposal.durationSeconds)].filter(Boolean).join('  ·  ');
+  const notes = Array.isArray(proposal.sideEffects)
+    ? proposal.sideEffects
+    : proposal.sideEffects ? [proposal.sideEffects] : [];
+  const subject = proposal.items?.length ? null : proposal.task?.title;
+  const remaining = expiresAt && windowMs ? Math.max(0, Math.min(1, (expiresAt - now) / windowMs)) : 0;
+  const secondsLeft = expiresAt ? Math.max(0, Math.ceil((expiresAt - now) / 1000)) : 0;
 
   return (
     <div role="presentation" style={backdropStyle}>
-      <section role="dialog" aria-modal="true" aria-labelledby="proposal-title" aria-busy={phase === 'applying'} style={cardStyle}>
-        <div style={eyebrowRowStyle}>
-          <span style={eyebrowStyle}>AGENT PROPOSAL</span>
-          {queuedCount > 0 && <span style={queueStyle}>{queuedCount} more waiting</span>}
-        </div>
-        <h2 id="proposal-title" style={titleStyle}>{proposal.title || actionLabel}</h2>
-        {proposal.summary && <p style={summaryStyle}>{proposal.summary}</p>}
-        <p style={introStyle}>Review the exact change. Nothing is written until you approve.</p>
-
-        <dl style={detailListStyle}>
-          <Detail label="Action" value={actionLabel} />
-          <Detail label="Task" value={proposal.task?.title} />
-          <Detail label="Project" value={project} />
-          <Detail label="Time" value={time} />
-          <Detail label="Reason" value={proposal.reason} />
-          <Detail
-            label="Source"
-            value={[
-              proposal.provenance?.origin,
-              proposal.provenance?.durationSource,
-            ].filter(Boolean).join(' · ') || 'Agent proposal'}
-          />
-        </dl>
-
-        {proposal.items && proposal.items.length > 0 && (
-          <ul aria-label="Tasks" style={itemListStyle}>
-            {proposal.items.map((item, index) => (
-              <li key={`${item.title}-${index}`} style={itemRowStyle}>
-                <span style={itemTitleStyle}>{item.title}</span>
-                <span style={itemMetaStyle}>
-                  {item.sessions > 0
-                    ? `${item.sessions} session${item.sessions === 1 ? '' : 's'} · ${formatDuration(item.durationSeconds)}`
-                    : 'No time to log'}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-
-        {sideEffects.length > 0 && (
-          <div style={effectsStyle}>
-            <span style={effectLabelStyle}>WHAT WILL CHANGE</span>
-            {sideEffects.map((effect, index) => <span key={`${effect}-${index}`}>• {effect}</span>)}
-          </div>
-        )}
-
-        {phase === 'failed' ? (
-          <>
-            <div role="alert" style={errorStyle}>
-              <strong style={{ color: '#FF6961' }}>Not applied.</strong> {error}
+      <div style={stackStyle}>
+        {queuedCount > 0 && <div aria-hidden style={peekStyle(queuedCount > 1)} />}
+        <section
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="proposal-title"
+          aria-busy={phase === 'applying'}
+          style={cardStyle}
+        >
+          {reviewing && expiresAt && (
+            <div
+              role="progressbar"
+              aria-label={`${secondsLeft} seconds to respond`}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(remaining * 100)}
+              style={timeTrackStyle}
+            >
+              <div style={{ ...timeFillStyle, transform: `scaleX(${remaining})` }} />
             </div>
-            <button type="button" onClick={() => onDismiss(proposal.requestId)} style={approveButtonStyle}>Close</button>
-          </>
-        ) : (
-          <>
-            {reviewing && expiresAt && (
-              <div role="status" style={expiryStyle}>
-                Expires in {Math.max(1, Math.ceil((expiresAt - now) / 1000))} seconds
-              </div>
-            )}
-            {phase === 'applying' && (
-              <div role="status" aria-live="polite" style={expiryStyle}>Applying in Flumen…</div>
-            )}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9 }}>
-              <button type="button" onClick={decline} disabled={!reviewing} style={buttonState(declineButtonStyle, reviewing)}>Decline</button>
-              <button type="button" onClick={approve} disabled={!reviewing} style={buttonState(approveButtonStyle, reviewing)}>
+          )}
+
+          <div style={originStyle}>
+            {proposal.provenance?.origin || 'Agent'}
+            {queuedCount > 0 && <span style={visuallyHidden}>, {queuedCount} more waiting</span>}
+          </div>
+          <h2 id="proposal-title" style={titleStyle}>{proposal.actionTitle || proposal.title || proposal.action}</h2>
+          {subject && <p style={subjectStyle}>{subject}</p>}
+          {meta && <p style={metaStyle}>{meta}</p>}
+          {proposal.reason && <p style={reasonStyle}>“{proposal.reason}”</p>}
+
+          {proposal.items && proposal.items.length > 0 && (
+            <ul aria-label="Tasks" style={itemListStyle}>
+              {proposal.items.map((item, index) => (
+                <li key={`${item.title}-${index}`} style={itemRowStyle}>
+                  <span style={itemTitleStyle}>{item.title}</span>
+                  <span style={itemMetaStyle} aria-label={`${item.sessions} sessions`}>
+                    <SessionPips count={item.sessions} />
+                    {formatDuration(item.durationSeconds) ?? '—'}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {notes.length > 0 && (
+            <ul style={notesStyle}>
+              {notes.map((note, index) => <li key={`${note}-${index}`}>{note}</li>)}
+            </ul>
+          )}
+
+          {phase === 'failed' ? (
+            <>
+              <p role="alert" style={errorStyle}>{error}</p>
+              <button type="button" onClick={() => onDismiss(proposal.requestId)} style={{ ...primaryButtonStyle, marginTop: 16 }}>
+                Close
+              </button>
+            </>
+          ) : (
+            <div style={actionsStyle}>
+              <button type="button" onClick={decline} disabled={!reviewing} style={buttonState(secondaryButtonStyle, reviewing)}>
+                Decline
+              </button>
+              <button type="button" onClick={approve} disabled={!reviewing} style={buttonState(primaryButtonStyle, reviewing)}>
                 {phase === 'applying' ? 'Applying…' : 'Approve'}
               </button>
             </div>
-          </>
-        )}
-      </section>
+          )}
+        </section>
+      </div>
     </div>
   );
 };
 
-const Detail: React.FC<{ label: string; value?: string | null }> = ({ label, value }) =>
-  value ? (
-    <div style={detailRowStyle}>
-      <dt style={termStyle}>{label}</dt>
-      <dd style={valueStyle}>{value}</dd>
-    </div>
-  ) : null;
+const SessionPips: React.FC<{ count: number }> = ({ count }) => (
+  <span aria-hidden style={pipRowStyle}>
+    {Array.from({ length: Math.min(count, MAX_PIPS) }).map((_, index) => <span key={index} style={pipStyle} />)}
+    {count > MAX_PIPS && <span>+{count - MAX_PIPS}</span>}
+  </span>
+);
 
 const buttonState = (style: React.CSSProperties, enabled: boolean): React.CSSProperties =>
-  enabled ? style : { ...style, opacity: 0.45, cursor: 'default' };
+  enabled ? style : { ...style, opacity: 0.4, cursor: 'default' };
 
-const backdropStyle: React.CSSProperties = { position: 'absolute', inset: 0, zIndex: 5000, background: 'rgba(0,0,0,.72)', backdropFilter: 'blur(16px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 22, borderRadius: theme.radii.window };
-const cardStyle: React.CSSProperties = { width: '100%', maxHeight: 'calc(100% - 12px)', overflowY: 'auto', boxSizing: 'border-box', padding: 20, borderRadius: 22, background: 'linear-gradient(150deg, #1B1B1B, #111)', border: '1px solid rgba(255,255,255,.11)', boxShadow: '0 30px 80px rgba(0,0,0,.7)', color: 'white', fontFamily: theme.fonts.display };
-const eyebrowRowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 7 };
-const eyebrowStyle: React.CSSProperties = { color: theme.colors.focus.primary, fontSize: 9, fontWeight: 800, letterSpacing: '.13em' };
-const queueStyle: React.CSSProperties = { color: 'rgba(255,255,255,.45)', fontSize: 9, fontWeight: 700 };
-const titleStyle: React.CSSProperties = { fontFamily: theme.fonts.brand, fontSize: 19, lineHeight: 1.2, letterSpacing: '-.025em', margin: 0 };
-const summaryStyle: React.CSSProperties = { color: 'rgba(255,255,255,.7)', fontSize: 11, lineHeight: 1.45, margin: '6px 0 0' };
-const introStyle: React.CSSProperties = { color: 'rgba(255,255,255,.48)', fontSize: 11, lineHeight: 1.5, margin: '7px 0 15px' };
-const detailListStyle: React.CSSProperties = { margin: 0, padding: 11, borderRadius: 12, background: 'rgba(255,255,255,.035)', display: 'flex', flexDirection: 'column', gap: 8 };
-const detailRowStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: '70px 1fr', gap: 8 };
-const termStyle: React.CSSProperties = { color: 'rgba(255,255,255,.32)', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.08em' };
-const valueStyle: React.CSSProperties = { margin: 0, color: 'rgba(255,255,255,.82)', fontSize: 11, overflowWrap: 'anywhere' };
-const itemListStyle: React.CSSProperties = { listStyle: 'none', margin: '8px 0 0', padding: 11, borderRadius: 12, background: 'rgba(255,255,255,.035)', display: 'flex', flexDirection: 'column', gap: 7 };
-const itemRowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 11 };
-const itemTitleStyle: React.CSSProperties = { color: 'rgba(255,255,255,.82)', overflowWrap: 'anywhere' };
-const itemMetaStyle: React.CSSProperties = { color: 'rgba(255,255,255,.45)', whiteSpace: 'nowrap' };
-const effectsStyle: React.CSSProperties = { marginTop: 11, padding: 11, borderRadius: 12, border: '1px solid rgba(255,159,10,.14)', background: 'rgba(255,159,10,.06)', display: 'flex', flexDirection: 'column', gap: 5, color: 'rgba(255,255,255,.65)', fontSize: 10 };
-const effectLabelStyle: React.CSSProperties = { color: '#FFB340', fontSize: 8, fontWeight: 800, letterSpacing: '.1em' };
-const expiryStyle: React.CSSProperties = { margin: '10px 0', color: 'rgba(255,255,255,.38)', fontSize: 9, textAlign: 'center' };
-const errorStyle: React.CSSProperties = { margin: '11px 0', padding: 11, borderRadius: 12, border: '1px solid rgba(255,69,58,.25)', background: 'rgba(255,69,58,.08)', color: 'rgba(255,255,255,.8)', fontSize: 11, lineHeight: 1.45 };
-const approveButtonStyle: React.CSSProperties = { width: '100%', height: 40, border: 0, borderRadius: 12, background: 'white', color: '#090909', fontSize: 12, fontWeight: 750, cursor: 'pointer' };
-const declineButtonStyle: React.CSSProperties = { ...approveButtonStyle, background: 'rgba(255,255,255,.065)', color: 'rgba(255,255,255,.7)', border: '1px solid rgba(255,255,255,.075)' };
+const backdropStyle: React.CSSProperties = { position: 'absolute', inset: 0, zIndex: 5000, background: 'rgba(0,0,0,.7)', backdropFilter: 'blur(16px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 22, borderRadius: theme.radii.window };
+const stackStyle: React.CSSProperties = { position: 'relative', width: '100%', maxHeight: 'calc(100% - 12px)', display: 'flex' };
+const peekStyle = (deep: boolean): React.CSSProperties => ({
+  position: 'absolute', left: 12, right: 12, bottom: -8, height: 40, borderRadius: 20,
+  background: '#202020', border: '1px solid rgba(255,255,255,.08)',
+  boxShadow: deep ? '0 8px 0 -4px #161616' : 'none',
+});
+const cardStyle: React.CSSProperties = { position: 'relative', width: '100%', maxHeight: '100%', overflowY: 'auto', boxSizing: 'border-box', padding: '22px 20px 18px', borderRadius: 22, background: '#1A1A1A', border: '1px solid rgba(255,255,255,.09)', boxShadow: '0 30px 80px rgba(0,0,0,.7)', color: theme.colors.text.primary, fontFamily: theme.fonts.display };
+const timeTrackStyle: React.CSSProperties = { position: 'absolute', top: 10, left: 20, right: 20, height: 2, overflow: 'hidden', borderRadius: 2, background: 'rgba(255,255,255,.06)' };
+const timeFillStyle: React.CSSProperties = { height: '100%', background: theme.colors.focus.primary, transformOrigin: 'left', transition: 'transform 1s linear' };
+const originStyle: React.CSSProperties = { color: theme.colors.text.muted, fontSize: 11, marginBottom: 6 };
+const titleStyle: React.CSSProperties = { fontFamily: theme.fonts.brand, fontSize: 21, fontWeight: 600, lineHeight: 1.15, letterSpacing: '-.02em', margin: 0 };
+const subjectStyle: React.CSSProperties = { margin: '6px 0 0', color: 'rgba(255,255,255,.78)', fontSize: 14, lineHeight: 1.35, overflowWrap: 'anywhere' };
+const metaStyle: React.CSSProperties = { margin: '8px 0 0', color: theme.colors.text.secondary, fontSize: 12, fontVariantNumeric: 'tabular-nums', whiteSpace: 'pre-wrap' };
+const reasonStyle: React.CSSProperties = { margin: '10px 0 0', color: 'rgba(255,255,255,.62)', fontSize: 12, lineHeight: 1.45, fontStyle: 'italic', overflowWrap: 'anywhere' };
+const itemListStyle: React.CSSProperties = { listStyle: 'none', margin: '14px 0 0', padding: 0, display: 'flex', flexDirection: 'column', borderTop: '1px solid rgba(255,255,255,.06)' };
+const itemRowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '9px 0', borderBottom: '1px solid rgba(255,255,255,.06)', fontSize: 12 };
+const itemTitleStyle: React.CSSProperties = { color: 'rgba(255,255,255,.86)', overflowWrap: 'anywhere' };
+const itemMetaStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, color: theme.colors.text.secondary, whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' };
+const pipRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 4, fontSize: 10 };
+const pipStyle: React.CSSProperties = { width: 5, height: 5, borderRadius: '50%', background: 'white' };
+const notesStyle: React.CSSProperties = { listStyle: 'none', margin: '14px 0 0', padding: 0, display: 'flex', flexDirection: 'column', gap: 4, color: theme.colors.text.secondary, fontSize: 12, lineHeight: 1.4 };
+const errorStyle: React.CSSProperties = { margin: '16px 0 0', color: '#FF6961', fontSize: 12, lineHeight: 1.45 };
+const actionsStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 20 };
+const primaryButtonStyle: React.CSSProperties = { width: '100%', height: 40, marginTop: 0, border: 0, borderRadius: 12, background: 'white', color: '#0A0A0A', fontSize: 13, fontWeight: 600, cursor: 'pointer' };
+const secondaryButtonStyle: React.CSSProperties = { ...primaryButtonStyle, background: 'rgba(255,255,255,.07)', color: 'rgba(255,255,255,.8)' };
+const visuallyHidden: React.CSSProperties = { position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)', whiteSpace: 'nowrap' };
 
 export default AgentProposalOverlay;

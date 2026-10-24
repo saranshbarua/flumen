@@ -13,18 +13,33 @@ const baseProposal = {
   action: 'finish_focus',
   actionTitle: 'Finish focus',
   title: 'Write report',
+  task: { id: 't1', title: 'Write report' },
   summary: 'Cursor · Finish focus',
-  sideEffects: ['Stops the active timer and advances the session', 'Marks “Write report” complete'],
+  provenance: { origin: 'Cursor' },
+  sideEffects: ['Also marks “Write report” complete'],
   expiresAt: Date.now() + 60_000,
 };
 
 describe('AgentProposalOverlay', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('shows every side effect, including task completion', () => {
+  it('leads with the action and the task, without field labels', () => {
     render(<AgentProposalOverlay proposal={baseProposal} onApproving={vi.fn()} onDismiss={vi.fn()} />);
-    expect(screen.getByText(/Marks “Write report” complete/)).toBeTruthy();
-    expect(screen.getByText('Cursor · Finish focus')).toBeTruthy();
+    expect(screen.getByRole('heading').textContent).toBe('Finish focus');
+    expect(screen.getByText('Write report')).toBeTruthy();
+    expect(screen.getByText('Cursor')).toBeTruthy();
+    expect(screen.queryByText(/AGENT PROPOSAL|WHAT WILL CHANGE|ACTION|SOURCE/)).toBeNull();
+  });
+
+  it('shows consequences the heading does not already say', () => {
+    render(<AgentProposalOverlay proposal={baseProposal} onApproving={vi.fn()} onDismiss={vi.fn()} />);
+    expect(screen.getByText('Also marks “Write report” complete')).toBeTruthy();
+  });
+
+  it('shows time left as a progress bar instead of text', () => {
+    render(<AgentProposalOverlay proposal={baseProposal} onApproving={vi.fn()} onDismiss={vi.fn()} />);
+    expect(screen.getByRole('progressbar').getAttribute('aria-label')).toMatch(/seconds to respond/);
+    expect(screen.queryByText(/Expires in/)).toBeNull();
   });
 
   it('approving keeps the card open in an applying state', () => {
@@ -39,7 +54,7 @@ describe('AgentProposalOverlay', () => {
 
   it('disables both buttons while applying', () => {
     render(<AgentProposalOverlay proposal={baseProposal} phase="applying" onApproving={vi.fn()} onDismiss={vi.fn()} />);
-    expect((screen.getByText('Applying…', { selector: 'button' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText('Applying…') as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByText('Decline') as HTMLButtonElement).disabled).toBe(true);
   });
 
@@ -54,14 +69,14 @@ describe('AgentProposalOverlay', () => {
         onDismiss={onDismiss}
       />
     );
-    expect(screen.getByRole('alert').textContent).toContain('Task was changed after approval.');
+    expect(screen.getByRole('alert').textContent).toBe('Task was changed after approval.');
     fireEvent.click(screen.getByText('Close'));
     expect(onDismiss).toHaveBeenCalledWith('r1');
   });
 
-  it('shows how many proposals are queued behind this one', () => {
+  it('signals queued proposals through layout and to screen readers', () => {
     render(<AgentProposalOverlay proposal={baseProposal} queuedCount={2} onApproving={vi.fn()} onDismiss={vi.fn()} />);
-    expect(screen.getByText('2 more waiting')).toBeTruthy();
+    expect(screen.getByText(/2 more waiting/)).toBeTruthy();
   });
 
   it('lists every task with its sessions in a batch completion', () => {
@@ -71,7 +86,6 @@ describe('AgentProposalOverlay', () => {
           requestId: 'batch',
           action: 'complete_tasks',
           actionTitle: 'Complete tasks',
-          title: 'Complete 2 tasks',
           items: [
             { title: 'Smoke-test build', sessions: 3, durationSeconds: 4500 },
             { title: 'Already filled', sessions: 0, durationSeconds: 0 },
@@ -82,8 +96,8 @@ describe('AgentProposalOverlay', () => {
       />
     );
     expect(screen.getByText('Smoke-test build')).toBeTruthy();
-    expect(screen.getByText('3 sessions · 1h 15m')).toBeTruthy();
-    expect(screen.getByText('No time to log')).toBeTruthy();
+    expect(screen.getByLabelText('3 sessions').textContent).toBe('1h 15m');
+    expect(screen.getByLabelText('0 sessions').textContent).toBe('—');
   });
 
   it('declines and dismisses immediately', () => {
