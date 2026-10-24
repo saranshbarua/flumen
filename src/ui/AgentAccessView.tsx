@@ -23,11 +23,11 @@ const initialSettings: AgentAccessSettings = {
 };
 
 const statusColor: Record<AgentAccessStatus, string> = {
-  off: 'rgba(255,255,255,.22)',
+  off: theme.colors.text.muted,
   starting: '#FF9F0A',
-  ready: '#30D158',
-  connected: '#30D158',
-  error: '#FF453A',
+  ready: theme.colors.shortBreak.primary,
+  connected: theme.colors.shortBreak.primary,
+  error: theme.colors.focus.primary,
 };
 
 type UnknownRecord = Record<string, unknown>;
@@ -234,11 +234,10 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
       </header>
 
       <div style={scrollStyle}>
-        <div style={shellStyle}>
           <section aria-label={`Agent Access: ${title}`} style={heroStyle}>
             <div style={heroRowStyle}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-                <span aria-hidden style={{ ...dotStyle, background: statusColor[status], boxShadow: connected ? `0 0 0 4px rgba(48,209,88,.14)` : 'none' }} />
+                <span aria-hidden style={{ ...dotStyle, background: statusColor[status], boxShadow: connected ? `0 0 0 4px ${theme.colors.shortBreak.glow}` : 'none' }} />
                 <span aria-live="polite" style={heroTitleStyle}>{title}</span>
               </div>
               <button
@@ -258,7 +257,7 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
             {status === 'off' && (
               <p style={heroHelperStyle}>Let agents on this Mac read your focus data and propose changes you approve.</p>
             )}
-            {status === 'error' && statusError && <p style={{ ...heroHelperStyle, color: '#FF8A80' }}>{statusError}</p>}
+            {status === 'error' && statusError && <p style={{ ...heroHelperStyle, color: theme.colors.focus.primary }}>{statusError}</p>}
             {otherNames && <p style={heroHelperStyle}>{otherNames}</p>}
 
             {status === 'error' && (
@@ -289,7 +288,6 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
               </div>
             )}
           </section>
-        </div>
 
         {enabledAndHealthy && (
           <section style={sectionStyle} aria-label="Connect an agent">
@@ -358,7 +356,6 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
 
       {consentStep > 0 && (
         <div className="agent-consent" role="dialog" aria-modal="true" aria-labelledby="agent-consent-title" style={consentBackdropStyle}>
-          <div style={consentShellStyle}>
             <div style={consentCardStyle}>
               <div aria-label={`Step ${consentStep} of 2`} style={stepDotsStyle}>
                 <span style={stepDotStyle(consentStep >= 1)} />
@@ -413,7 +410,6 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
                 </>
               )}
             </div>
-          </div>
         </div>
       )}
     </div>
@@ -436,54 +432,51 @@ const panelMotion = `
   }
 `;
 
-const panelStyle: React.CSSProperties = { position: 'absolute', inset: 0, zIndex: 120, background: theme.colors.background, borderRadius: theme.radii.window, padding: '24px 20px', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', color: 'white', fontFamily: theme.fonts.brand };
-const headerStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 };
-const headerTitleStyle: React.CSSProperties = { margin: 0, fontFamily: theme.fonts.brand, fontSize: '1.1rem', fontWeight: 600, letterSpacing: '-0.02em' };
-const backButtonStyle: React.CSSProperties = { width: 32, height: 32, borderRadius: 16, border: 'none', background: 'rgba(255,255,255,.05)', color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', padding: 0, flexShrink: 0 };
-const scrollStyle: React.CSSProperties = { overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 22, paddingBottom: 12 };
+const panelStyle: React.CSSProperties = { position: 'absolute', inset: 0, zIndex: 120, background: theme.colors.background, borderRadius: theme.radii.window, padding: 24, boxSizing: 'border-box', display: 'flex', flexDirection: 'column', color: theme.colors.text.primary, fontFamily: theme.fonts.display };
+const headerStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24 };
+const headerTitleStyle: React.CSSProperties = { margin: 0, fontFamily: theme.fonts.brand, fontSize: '1.2rem', fontWeight: 700, letterSpacing: '-0.02em' };
+const backButtonStyle: React.CSSProperties = { width: 32, height: 32, borderRadius: 16, border: 'none', background: theme.colors.button.background, color: theme.colors.text.primary, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', padding: 0, flexShrink: 0 };
+const scrollStyle: React.CSSProperties = { overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 20, paddingBottom: 12 };
 
-// Two-layer bezel: a translucent shell holding a solid core with concentric corners.
-const shellStyle: React.CSSProperties = { padding: 4, borderRadius: 22, background: 'rgba(255,255,255,.04)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,.06)' };
-const heroStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', padding: '16px 16px', borderRadius: 18, background: '#151515', boxShadow: 'inset 0 1px 1px rgba(255,255,255,.07)' };
+const heroStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', padding: '14px 16px', borderRadius: theme.radii.button, background: theme.colors.surface, border: `1px solid ${theme.colors.border}` };
 const heroRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 };
-const dotStyle: React.CSSProperties = { width: 8, height: 8, borderRadius: '50%', flexShrink: 0, transition: `box-shadow 400ms ${SPRING}` };
-const heroTitleStyle: React.CSSProperties = { fontSize: 17, fontWeight: 600, letterSpacing: '-.02em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
-const heroHelperStyle: React.CSSProperties = { margin: '8px 0 0', fontSize: 12, lineHeight: 1.45, color: 'rgba(255,255,255,.5)' };
-const textButtonStyle: React.CSSProperties = { alignSelf: 'flex-start', marginTop: 10, padding: 0, border: 'none', background: 'none', color: 'rgba(255,255,255,.5)', fontFamily: theme.fonts.brand, fontSize: 12, fontWeight: 500, cursor: 'pointer' };
-const confirmStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 4, marginTop: 6 };
+const dotStyle: React.CSSProperties = { width: 8, height: 8, borderRadius: '50%', flexShrink: 0 };
+const heroTitleStyle: React.CSSProperties = { fontSize: '0.95rem', fontWeight: 650, letterSpacing: '-.01em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+const heroHelperStyle: React.CSSProperties = { margin: '8px 0 0', fontSize: '0.7rem', lineHeight: 1.45, color: theme.colors.text.muted };
+const textButtonStyle: React.CSSProperties = { alignSelf: 'flex-start', marginTop: 8, padding: 0, border: 'none', background: 'none', color: theme.colors.text.secondary, fontFamily: theme.fonts.display, fontSize: '0.75rem', fontWeight: 600, cursor: 'pointer' };
+const confirmStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 4, marginTop: 8 };
 const confirmActionsStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 10 };
 
 const sectionStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 8 };
-const rowSectionStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 14 };
-const manualSectionStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 10, paddingTop: 16, borderTop: '1px solid rgba(255,255,255,.05)' };
-const rowTitleStyle: React.CSSProperties = { color: 'white', fontSize: 14, fontWeight: 500 };
-const helperStyle: React.CSSProperties = { margin: '3px 0 0', fontSize: 11.5, lineHeight: 1.45, color: 'rgba(255,255,255,.45)' };
+const rowSectionStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, paddingTop: 16, borderTop: `1px solid ${theme.colors.border}` };
+const manualSectionStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 10, paddingTop: 16, borderTop: `1px solid ${theme.colors.border}` };
+const rowTitleStyle: React.CSSProperties = { color: theme.colors.text.primary, fontSize: '0.85rem', fontWeight: 500 };
+const helperStyle: React.CSSProperties = { margin: '2px 0 0', fontSize: '0.7rem', lineHeight: 1.45, color: theme.colors.text.muted };
 const twoColumnStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 };
 
-const primaryButtonStyle: React.CSSProperties = { minHeight: 42, borderRadius: 999, border: 'none', background: '#F5F5F3', color: '#0A0A0A', fontFamily: theme.fonts.brand, fontWeight: 600, fontSize: 13, cursor: 'pointer', padding: '0 16px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, whiteSpace: 'nowrap' };
-const secondaryButtonStyle: React.CSSProperties = { ...primaryButtonStyle, color: 'rgba(255,255,255,.82)', background: 'rgba(255,255,255,.06)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,.06)' };
-const smallSecondaryStyle: React.CSSProperties = { ...secondaryButtonStyle, minHeight: 34, fontSize: 12 };
-const smallDangerStyle: React.CSSProperties = { ...smallSecondaryStyle, background: 'rgba(255,69,58,.14)', color: '#FF6961', boxShadow: 'none' };
+const primaryButtonStyle: React.CSSProperties = { minHeight: 40, borderRadius: theme.radii.button, border: 'none', background: theme.colors.text.primary, color: theme.colors.background, fontFamily: theme.fonts.display, fontWeight: 650, fontSize: '0.8rem', cursor: 'pointer', padding: '0 16px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, whiteSpace: 'nowrap' };
+const secondaryButtonStyle: React.CSSProperties = { ...primaryButtonStyle, color: theme.colors.text.primary, background: theme.colors.button.background, border: `1px solid ${theme.colors.border}` };
+const smallSecondaryStyle: React.CSSProperties = { ...secondaryButtonStyle, minHeight: 34, fontSize: '0.75rem' };
+const smallDangerStyle: React.CSSProperties = { ...smallSecondaryStyle, background: 'rgba(255,95,87,.1)', color: theme.colors.focus.primary, border: '1px solid rgba(255,95,87,.28)' };
 
-const disclosureStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', border: 'none', background: 'transparent', color: 'rgba(255,255,255,.6)', padding: 0, fontFamily: theme.fonts.brand, fontSize: 13, fontWeight: 500, cursor: 'pointer' };
-const chevronStyle: React.CSSProperties = { display: 'inline-block', fontSize: 18, lineHeight: 1, transition: `transform 320ms ${SPRING}` };
-const pathRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 10, padding: '10px 10px 10px 12px', borderRadius: 14, background: 'rgba(255,255,255,.03)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,.05)' };
-const pathStyle: React.CSSProperties = { flex: 1, minWidth: 0, fontFamily: theme.fonts.mono, fontSize: 10, lineHeight: 1.5, color: 'rgba(255,255,255,.6)', overflowWrap: 'anywhere' };
-const copyChipStyle: React.CSSProperties = { ...secondaryButtonStyle, minHeight: 28, padding: '0 12px', fontSize: 11, flexShrink: 0 };
+const disclosureStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', border: 'none', background: 'transparent', color: theme.colors.text.primary, padding: 0, fontFamily: theme.fonts.display, fontSize: '0.85rem', fontWeight: 500, cursor: 'pointer' };
+const chevronStyle: React.CSSProperties = { display: 'inline-block', color: theme.colors.text.muted, fontSize: 18, lineHeight: 1, transition: `transform 320ms ${SPRING}` };
+const pathRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderRadius: 12, background: theme.colors.surface, border: `1px solid ${theme.colors.border}` };
+const pathStyle: React.CSSProperties = { flex: 1, minWidth: 0, fontFamily: theme.fonts.mono, fontSize: 10, lineHeight: 1.5, color: theme.colors.text.secondary, overflowWrap: 'anywhere' };
+const copyChipStyle: React.CSSProperties = { ...secondaryButtonStyle, minHeight: 28, padding: '0 12px', fontSize: '0.7rem', flexShrink: 0 };
 
-const toggleStyle = (enabled: boolean): React.CSSProperties => ({ position: 'relative', width: 42, height: 24, border: 0, borderRadius: 12, background: enabled ? theme.colors.focus.primary : 'rgba(255,255,255,.12)', padding: 0, cursor: 'pointer', flexShrink: 0, transition: `background-color 300ms ${SPRING}` });
-const toggleKnobStyle = (enabled: boolean): React.CSSProperties => ({ position: 'absolute', top: 3, left: 3, width: 18, height: 18, borderRadius: '50%', background: 'white', transform: `translateX(${enabled ? 18 : 0}px)`, transition: `transform 320ms ${SPRING}`, boxShadow: '0 1px 3px rgba(0,0,0,.25)' });
+const toggleStyle = (enabled: boolean): React.CSSProperties => ({ position: 'relative', width: 44, height: 24, border: 0, borderRadius: 12, background: enabled ? theme.colors.focus.primary : 'rgba(255,255,255,.1)', padding: 0, cursor: 'pointer', flexShrink: 0, transition: 'background-color 0.3s cubic-bezier(0.4, 0, 0.2, 1)' });
+const toggleKnobStyle = (enabled: boolean): React.CSSProperties => ({ position: 'absolute', top: 3, left: enabled ? 23 : 3, width: 18, height: 18, borderRadius: '50%', background: 'white', transition: 'left 0.3s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: '0 2px 4px rgba(0,0,0,.2)' });
 
-const consentBackdropStyle: React.CSSProperties = { position: 'absolute', inset: 0, zIndex: 10, background: 'linear-gradient(180deg, rgba(0,0,0,.4) 0%, rgba(0,0,0,.82) 55%)', backdropFilter: 'blur(14px)', display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', padding: 8, borderRadius: theme.radii.window };
-const consentShellStyle: React.CSSProperties = { padding: 5, borderRadius: 20, background: 'rgba(255,255,255,.045)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,.07), 0 40px 90px -20px rgba(0,0,0,.65)' };
-const consentCardStyle: React.CSSProperties = { padding: '20px 18px 18px', boxSizing: 'border-box', borderRadius: 15, background: '#161616', boxShadow: 'inset 0 1px 1px rgba(255,255,255,.08)', display: 'flex', flexDirection: 'column', gap: 14 };
+const consentBackdropStyle: React.CSSProperties = { position: 'absolute', inset: 0, zIndex: 10, background: 'rgba(0,0,0,.72)', backdropFilter: 'blur(16px)', display: 'flex', alignItems: 'flex-end', padding: 16, borderRadius: theme.radii.window };
+const consentCardStyle: React.CSSProperties = { width: '100%', padding: '20px 18px 16px', boxSizing: 'border-box', borderRadius: theme.radii.button, background: theme.colors.surface, border: `1px solid ${theme.colors.border}`, display: 'flex', flexDirection: 'column', gap: 14 };
 const stepDotsStyle: React.CSSProperties = { display: 'flex', gap: 5 };
-const stepDotStyle = (active: boolean): React.CSSProperties => ({ width: active ? 16 : 5, height: 5, borderRadius: 3, background: active ? 'white' : 'rgba(255,255,255,.2)', transition: `width 360ms ${SPRING}` });
-const consentTitleStyle: React.CSSProperties = { margin: 0, fontFamily: theme.fonts.brand, fontSize: 21, fontWeight: 600, lineHeight: 1.15, letterSpacing: '-.025em' };
-const consentBodyStyle: React.CSSProperties = { margin: 0, color: 'rgba(255,255,255,.6)', fontSize: 12.5, lineHeight: 1.5 };
-const consentListStyle: React.CSSProperties = { margin: 0, padding: 0, listStyle: 'none', display: 'flex', flexDirection: 'column', gap: 8, color: 'rgba(255,255,255,.75)', fontSize: 13.5, lineHeight: 1.4 };
-const consentActionsStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 8, marginTop: 6 };
-const checkboxLabelStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 10, color: 'rgba(255,255,255,.85)', fontSize: 13, cursor: 'pointer' };
-const quietCheckboxLabelStyle: React.CSSProperties = { ...checkboxLabelStyle, color: 'rgba(255,255,255,.5)', fontSize: 12 };
+const stepDotStyle = (active: boolean): React.CSSProperties => ({ width: active ? 16 : 5, height: 5, borderRadius: 3, background: active ? theme.colors.text.primary : theme.colors.button.background, transition: `width 360ms ${SPRING}` });
+const consentTitleStyle: React.CSSProperties = { margin: 0, fontFamily: theme.fonts.brand, fontSize: '1.15rem', fontWeight: 700, lineHeight: 1.2, letterSpacing: '-.02em' };
+const consentBodyStyle: React.CSSProperties = { margin: 0, color: theme.colors.text.secondary, fontSize: '0.75rem', lineHeight: 1.5 };
+const consentListStyle: React.CSSProperties = { margin: 0, padding: 0, listStyle: 'none', display: 'flex', flexDirection: 'column', gap: 8, color: theme.colors.text.primary, fontSize: '0.82rem', lineHeight: 1.4 };
+const consentActionsStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 8 };
+const checkboxLabelStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 10, color: theme.colors.text.primary, fontSize: '0.8rem', cursor: 'pointer' };
+const quietCheckboxLabelStyle: React.CSSProperties = { ...checkboxLabelStyle, color: theme.colors.text.muted, fontSize: '0.75rem' };
 
 export default AgentAccessView;
