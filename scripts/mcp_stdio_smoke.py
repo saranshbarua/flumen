@@ -200,13 +200,18 @@ class StubFlumen:
             shutil.rmtree(self.directory, ignore_errors=True)
 
 
-def _assert_flumen_icons(icons: Any, label: str) -> None:
-    if not isinstance(icons, list) or not icons:
-        raise AssertionError(f"Missing SEP-973 icons on {label}")
-    first = icons[0]
-    src = first.get("src") if isinstance(first, dict) else None
-    if not isinstance(src, str) or not src.startswith("data:image/png;base64,"):
-        raise AssertionError(f"Expected embedded PNG icon on {label}, got {first!r}")
+def _assert_no_extension_fields(value: Any, label: str) -> None:
+    """Optional icon and website fields are omitted.
+
+    They are legal in the current spec, but several clients reject the whole
+    handshake when `icons` or `websiteUrl` appears. A baseline initialize result
+    is what every client since the first MCP revision accepts.
+    """
+    if not isinstance(value, dict):
+        return
+    for key in ("icons", "websiteUrl"):
+        if key in value:
+            raise AssertionError(f"{label} must not include {key}")
 
 
 def request(
@@ -292,12 +297,13 @@ def run_handshake(helper: MCPProcess, helper_path: Path, stub: StubFlumen | None
         raise AssertionError(
             f"Missing expected tools: {', '.join(sorted(missing_tools))}"
         )
-    _assert_flumen_icons(
-        initialize.get("serverInfo", {}).get("icons"),
-        "serverInfo",
-    )
+    server_info = initialize.get("serverInfo", {})
+    if not isinstance(server_info, dict) or not server_info.get("name") or not initialize.get("protocolVersion"):
+        raise AssertionError(f"Initialize result is missing the baseline fields: {initialize!r}")
+    _assert_no_extension_fields(initialize, "initialize result")
+    _assert_no_extension_fields(server_info, "serverInfo")
     for tool in tools:
-        _assert_flumen_icons(tool.get("icons"), f"tool {tool.get('name')}")
+        _assert_no_extension_fields(tool, f"tool {tool.get('name')}")
 
     resources_result = request(helper, 3, "resources/list", {})
     resources = resources_result.get("resources", [])
@@ -308,9 +314,10 @@ def run_handshake(helper: MCPProcess, helper_path: Path, stub: StubFlumen | None
             f"Missing expected resources: {', '.join(sorted(missing_resources))}"
         )
     for resource in resources:
-        _assert_flumen_icons(
-            resource.get("icons"), f"resource {resource.get('uri')}"
-        )
+        _assert_no_extension_fields(resource, f"resource {resource.get('uri')}")
+    templates = request(helper, 8, "resources/templates/list", {})
+    if templates.get("resourceTemplates") != []:
+        raise AssertionError(f"Expected an empty resource template list, got {templates!r}")
 
     prompts_result = request(helper, 4, "prompts/list", {})
     prompts = prompts_result.get("prompts", [])
@@ -321,7 +328,7 @@ def run_handshake(helper: MCPProcess, helper_path: Path, stub: StubFlumen | None
             f"Missing expected prompts: {', '.join(sorted(missing_prompts))}"
         )
     for prompt in prompts:
-        _assert_flumen_icons(prompt.get("icons"), f"prompt {prompt.get('name')}")
+        _assert_no_extension_fields(prompt, f"prompt {prompt.get('name')}")
 
     payload = call_tool(helper, 5, "get_server_status", {})
     if not payload.get("ok") or not payload.get("agentAccessEnabled", True):
@@ -347,9 +354,55 @@ def run_handshake(helper: MCPProcess, helper_path: Path, stub: StubFlumen | None
         f"helper={helper_path} "
         f"server={initialize.get('serverInfo', {}).get('name', 'unknown')} "
         f"tools={len(tool_names)} resources={len(resource_uris)} "
-        f"prompts={len(prompt_names)} icons=ok "
+        f"prompts={len(prompt_names)} handshake=baseline "
         + ("app=stub writes=ok" if stub is not None else "app=authorized")
     )
+
+
+def run_closed_pipe(helper_path: Path, extra_env: dict[str, str] | None) -> None:
+    """A client may write the handshake and close stdin immediately.
+
+    The helper has to answer before it exits. An empty stdout with exit 0 is the
+    failure Codex reports as "exited immediately without responding."
+    """
+    messages = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "codex-mcp-client", "version": "1.0"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+    ]
+    payload = "".join(json.dumps(message, separators=(",", ":")) + "\n" for message in messages)
+    completed = subprocess.run(
+        [str(helper_path)],
+        input=payload,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        env={**os.environ, "FLUMEN_MCP_LOG_LEVEL": "error", **(extra_env or {})},
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"Closed-pipe helper exited {completed.returncode}: {completed.stderr!r}"
+        )
+    lines = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+    by_id = {line.get("id"): line for line in lines}
+    initialize = by_id.get(1, {})
+    tools = by_id.get(2, {})
+    if "result" not in initialize or "result" not in tools:
+        raise AssertionError(
+            f"Closed-pipe handshake missing responses: stdout={completed.stdout!r} stderr={completed.stderr!r}"
+        )
+    if not tools["result"].get("tools"):
+        raise AssertionError("Closed-pipe tools/list returned no tools")
 
 
 def main() -> int:
@@ -399,11 +452,13 @@ def main() -> int:
             return 0
 
         run_handshake(helper, helper_path, stub)
+        if stub is not None:
+            run_closed_pipe(helper_path, extra_env)
         return 0
     except Exception as error:
         exit_code = helper.process.poll()
         stderr = helper.stderr_text()
-        if not must_handshake and exit_code not in (None, 0) and is_known_refusal(stderr):
+        if not must_handshake and is_known_refusal(f"{error}\n{stderr}"):
             # Agent Access can flip off mid-handshake; that refusal is still correct behavior.
             print(
                 "MCP stdio smoke test passed: "

@@ -12,9 +12,9 @@ Flumen exposes a local MCP server through a signed stdio helper bundled inside t
 
 If Agent Access is off or Flumen is closed, `flumen-mcp` refuses to stay connected. Cursor should show an error or disconnected state — not a healthy green session. That is intentional: Cursor “connected” must not outlive Flumen authorization.
 
-## Branding in agent clients
+## Client compatibility
 
-`flumen-mcp` advertises Flumen’s mark via MCP SEP-973 `icons` on `serverInfo`, tools, resources, and prompts (embedded PNG data URI). Clients that implement icon rendering (Cursor, Claude, ChatGPT, and others) can show it next to Flumen tool calls. Display still depends on each client’s UI support.
+The helper speaks baseline MCP stdio JSON. `initialize`, tool, resource, and prompt results omit optional `icons` and `websiteUrl` fields. Those fields are in the current spec, but several clients reject the entire handshake when they appear. A client only needs the absolute path to `flumen-mcp`. When that binary is inside `Flumen.app`, it finds that app’s bundle id itself. Set `FLUMEN_BUNDLE_ID` only to target a different build than the one that contains the helper.
 
 ## Add to Cursor
 

@@ -17,7 +17,7 @@ struct FlumenMCPMain {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "2.4.0"
         let clientName = ProcessInfo.processInfo.environment["FLUMEN_MCP_CLIENT_NAME"] ?? "flumen-mcp"
         let clientVersion = ProcessInfo.processInfo.environment["FLUMEN_MCP_CLIENT_VERSION"] ?? version
-        let bundleID = ProcessInfo.processInfo.environment["FLUMEN_BUNDLE_ID"] ?? "com.saranshbarua.flumen"
+        let bundleID = resolvedBundleIdentifier()
         let socketPath = FlumenSocketPath.current(bundleIdentifier: bundleID)
         let metadata = IPCClientMetadata(
             id: UUID().uuidString,
@@ -27,15 +27,7 @@ struct FlumenMCPMain {
         )
         let ipc = UnixSocketClient(path: socketPath, metadata: metadata)
         let proxy = FlumenIPCProxy(client: ipc)
-
-        // Refuse to run as a healthy MCP server unless Flumen has authorized Agent Access.
-        // This keeps Cursor from showing a calm green "connected" state while access is off.
-        do {
-            try await requireAuthorizedAccess(proxy: proxy)
-        } catch {
-            fputs("\(authorizationMessage(for: error))\n", stderr)
-            Foundation.exit(1)
-        }
+        let sessionReady = SessionReady()
 
         let server = Server(
             name: "Flumen",
@@ -52,14 +44,24 @@ struct FlumenMCPMain {
         await registerPrompts(on: server)
 
         do {
-            let transport = IconInjectingStdioTransport(logger: logger)
+            // Stock JSON, but do not exit on stdin EOF until each request has a reply.
+            let transport = DrainStdioTransport(logger: logger)
             try await server.start(transport: transport) { clientInfo, _ in
                 logger.info("MCP client connected: \(clientInfo.name) \(clientInfo.version)")
                 await proxy.updateClient(name: clientInfo.name, version: clientInfo.version)
-                try await requireAuthorizedAccess(proxy: proxy)
+                do {
+                    try await requireAuthorizedAccess(proxy: proxy)
+                } catch {
+                    // Answer with a JSON-RPC error first. Exiting before stdout has a
+                    // message is what clients report as a format error.
+                    scheduleHelperExit(message: authorizationMessage(for: error))
+                    throw error
+                }
+                await sessionReady.markReady()
             }
 
             let heartbeat = Task {
+                await sessionReady.waitUntilReady()
                 while !Task.isCancelled {
                     try await Task.sleep(for: .seconds(3))
                     do {
@@ -152,7 +154,12 @@ private func authorizationMessage(for error: Error) -> String {
         case "session_disconnected":
             return "Flumen disconnected this agent session. Restart Flumen MCP in your agent to reconnect."
         case "app_unavailable", "ipc_failure", "connection_closed":
-            return "Flumen is not available. Open Flumen on this Mac, turn on Agent Access, and try again."
+            let generic = "Flumen is not available. Open Flumen on this Mac, turn on Agent Access, and try again."
+            let detail = error.message.trimmingCharacters(in: .whitespacesAndNewlines)
+            if detail.isEmpty || detail == generic || detail.hasPrefix(generic) {
+                return generic
+            }
+            return "\(generic) \(detail)"
         default:
             return error.message
         }
@@ -362,9 +369,9 @@ private func scheduleHelperExit(message: String) {
 
 private func registerResources(on server: Server, proxy: FlumenIPCProxy) async {
     let resources = [
-        Resource(name: "Focus Status", uri: "flumen://status", description: "Current timer and active task", icons: FlumenMCPIcons.brand),
-        Resource(name: "Today", uri: "flumen://today", description: "Today's focus totals", icons: FlumenMCPIcons.brand),
-        Resource(name: "Active Task", uri: "flumen://active-task", description: "Currently selected task", icons: FlumenMCPIcons.brand)
+        Resource(name: "Focus Status", uri: "flumen://status", description: "Current timer and active task"),
+        Resource(name: "Today", uri: "flumen://today", description: "Today's focus totals"),
+        Resource(name: "Active Task", uri: "flumen://active-task", description: "Currently selected task")
     ]
 
     await server.withMethodHandler(ListResources.self) { _ in
@@ -375,6 +382,12 @@ private func registerResources(on server: Server, proxy: FlumenIPCProxy) async {
             scheduleHelperExit(message: authorizationMessage(for: error))
             throw error
         }
+    }
+
+    // Codex probes this after initialize. Method-not-found makes the Codex app
+    // drop the session, so an empty list is the compatible answer.
+    await server.withMethodHandler(ListResourceTemplates.self) { _ in
+        .init(templates: [])
     }
 
     await server.withMethodHandler(ReadResource.self) { params in
@@ -406,16 +419,14 @@ private func registerPrompts(on server: Server) async {
             description: "Help recover forgotten meetings or short work into Flumen with confirmation.",
             arguments: [
                 .init(name: "hint", description: "Optional description of the missing work")
-            ],
-            icons: FlumenMCPIcons.brand
+            ]
         ),
         Prompt(
             name: "plan_focus_day",
             description: "Propose a small Flumen day plan from calendar or project context.",
             arguments: [
                 .init(name: "context", description: "Optional planning context")
-            ],
-            icons: FlumenMCPIcons.brand
+            ]
         ),
         Prompt(
             name: "weekly_focus_review",
@@ -423,8 +434,7 @@ private func registerPrompts(on server: Server) async {
             arguments: [
                 .init(name: "start", description: "Optional ISO-8601 start"),
                 .init(name: "end", description: "Optional ISO-8601 end")
-            ],
-            icons: FlumenMCPIcons.brand
+            ]
         )
     ]
 
@@ -476,9 +486,61 @@ private func tool(
             "type": .string("object"),
             "properties": .object(properties),
             "required": .array(required.map(Value.string))
-        ]),
-        icons: FlumenMCPIcons.brand
+        ])
     )
+}
+
+/// `FLUMEN_BUNDLE_ID` wins. Otherwise use the Flumen.app that contains this helper,
+/// so a client that only stores the command path still reaches the running app.
+private func resolvedBundleIdentifier() -> String {
+    let environment = ProcessInfo.processInfo.environment["FLUMEN_BUNDLE_ID"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    if let environment, !environment.isEmpty {
+        return environment
+    }
+    if let discovered = bundleIdentifierContainingExecutable() {
+        return discovered
+    }
+    return "com.saranshbarua.flumen"
+}
+
+private func bundleIdentifierContainingExecutable() -> String? {
+    var url = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        .deletingLastPathComponent()
+    for _ in 0..<8 {
+        if let identifier = Bundle(url: url)?.bundleIdentifier, !identifier.isEmpty {
+            return identifier
+        }
+        let parent = url.deletingLastPathComponent()
+        if parent.path == url.path { break }
+        url = parent
+    }
+    return nil
+}
+
+/// Heartbeats stay quiet until initialize has reached Flumen. A failed handshake
+/// must be a JSON-RPC error, not a process that dies before it speaks.
+private actor SessionReady {
+    private var ready = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func markReady() {
+        ready = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+
+    func waitUntilReady() async {
+        if ready { return }
+        await withCheckedContinuation { continuation in
+            if ready {
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+            }
+        }
+    }
 }
 
 private func encodeJSON(_ value: JSONValue) throws -> String {

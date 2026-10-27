@@ -65,16 +65,28 @@ const normalizeConnections = (detail: unknown): AgentConnection[] => {
     }));
 };
 
+/** One label per app. Codex keeps several helper processes for a single window. */
+const distinctAgentNames = (connections: AgentConnection[]): string[] => {
+  const names: string[] = [];
+  for (const connection of connections) {
+    const name = connection.name ?? 'Agent';
+    if (!names.includes(name)) names.push(name);
+  }
+  return names;
+};
+
 const statusTitle = (status: AgentAccessStatus, connections: AgentConnection[]) => {
   switch (status) {
     case 'off': return 'Off';
     case 'starting': return 'Starting…';
     case 'ready': return 'Ready';
     case 'error': return 'Couldn’t start';
-    case 'connected':
-      return connections.length > 1
-        ? `${connections.length} agents connected`
-        : `${connections[0]?.name ?? 'Agent'} connected`;
+    case 'connected': {
+      const names = distinctAgentNames(connections);
+      return names.length > 1
+        ? `${names.length} agents connected`
+        : `${names[0] ?? 'Agent'} connected`;
+    }
   }
 };
 
@@ -82,10 +94,18 @@ interface AgentAccessViewProps {
   onBack: () => void;
 }
 
+const ICON_SIZE = 14;
+
 /** Cursor brand mark from Simple Icons (MIT). */
 const CursorMarkIcon: React.FC = () => (
-  <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+  <svg width={ICON_SIZE} height={ICON_SIZE} viewBox="0 0 24 24" fill="currentColor" aria-hidden style={inlineIconStyle}>
     <path d="M11.503.131 1.891 5.678a.84.84 0 0 0-.42.726v11.188c0 .3.162.575.42.724l9.609 5.55a1 1 0 0 0 .998 0l9.61-5.55a.84.84 0 0 0 .42-.724V6.404a.84.84 0 0 0-.42-.726L12.497.131a1.01 1.01 0 0 0-.996 0M2.657 6.338h18.55c.263 0 .43.287.297.515L12.23 22.918c-.062.107-.229.064-.229-.06V12.335a.59.59 0 0 0-.295-.51l-9.11-5.257c-.109-.063-.064-.23.061-.23" />
+  </svg>
+);
+
+const CopiedCheckIcon: React.FC = () => (
+  <svg width={ICON_SIZE} height={ICON_SIZE} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden style={inlineIconStyle}>
+    <polyline points="5 13 10 18 19 7" />
   </svg>
 );
 
@@ -97,9 +117,7 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
   const [privacyAcknowledged, setPrivacyAcknowledged] = useState(false);
   const [dontShowAgain, setDontShowAgain] = useState(false);
   const [confirmDisable, setConfirmDisable] = useState(false);
-  const [manualOpen, setManualOpen] = useState(false);
-  const [details, setDetails] = useState<Record<string, unknown>>({});
-  const [feedback, setFeedback] = useState('');
+  const [copied, setCopied] = useState(false);
   const [statusError, setStatusError] = useState('');
 
   useEffect(() => {
@@ -122,38 +140,22 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
       else if (payload.enabled === false || rawStatus === 'off') setStatus('off');
       else setStatus('ready');
     };
-    const handleDetails = (event: Event) => {
-      const payload = (event as CustomEvent).detail;
-      setDetails(isRecord(payload) ? payload : {});
-    };
-    const handleAction = (event: Event) => {
-      const detail = (event as CustomEvent).detail;
-      const payload: UnknownRecord = isRecord(detail) ? detail : {};
-      setFeedback(typeof payload.message === 'string'
-        ? payload.message
-        : payload.success === false ? 'That didn’t work. Try again.' : 'Done.');
-    };
-
     window.addEventListener('native:agentAccessSettings', handleSettings);
     window.addEventListener('native:agentConnectionStatus', handleStatus);
-    window.addEventListener('native:agentConnectionDetails', handleDetails);
-    window.addEventListener('native:agentAccessActionResult', handleAction);
     NativeBridge.getAgentAccessSettings();
     NativeBridge.getAgentConnectionStatus();
 
     return () => {
       window.removeEventListener('native:agentAccessSettings', handleSettings);
       window.removeEventListener('native:agentConnectionStatus', handleStatus);
-      window.removeEventListener('native:agentConnectionDetails', handleDetails);
-      window.removeEventListener('native:agentAccessActionResult', handleAction);
     };
   }, []);
 
   useEffect(() => {
-    if (!feedback) return;
-    const timer = window.setTimeout(() => setFeedback(''), 2500);
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1600);
     return () => window.clearTimeout(timer);
-  }, [feedback]);
+  }, [copied]);
 
   const persistSettings = (patch: Partial<AgentAccessSettings>) => {
     setSettings((current) => ({ ...current, ...patch }));
@@ -202,22 +204,11 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
     setDontShowAgain(false);
   };
 
-  const copyAction = (action: () => void, message: string) => {
-    action();
-    setFeedback(message);
-  };
-
-  const toggleManual = () => {
-    const next = !manualOpen;
-    setManualOpen(next);
-    if (next) NativeBridge.getAgentConnectionDetails();
-  };
-
   const connected = status === 'connected';
   const enabledAndHealthy = settings.enabled && status !== 'error';
   const title = statusTitle(status, connections);
-  const helperPath = typeof details.helperPath === 'string' ? details.helperPath : '';
-  const otherNames = connections.length > 1 ? connections.map((connection) => connection.name).join(', ') : '';
+  const agentNames = distinctAgentNames(connections);
+  const otherNames = agentNames.length > 1 ? agentNames.join(', ') : '';
 
   return (
     <div className="agent-access-panel" style={panelStyle}>
@@ -279,7 +270,7 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
             {confirmDisable && (
               <div role="alertdialog" aria-label="Turn off Agent Access?" style={confirmStyle}>
                 <span style={heroHelperStyle}>
-                  {connections.length > 1 ? 'Connected agents' : connections[0]?.name ?? 'The agent'} will be disconnected.
+                  {agentNames.length > 1 ? 'Connected agents' : agentNames[0] ?? 'The agent'} will be disconnected.
                 </span>
                 <div style={confirmActionsStyle}>
                   <button className="agent-control" onClick={() => setConfirmDisable(false)} style={smallSecondaryStyle}>Cancel</button>
@@ -293,10 +284,14 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
           <section style={sectionStyle} aria-label="Connect an agent">
             <button
               className="agent-control"
-              onClick={() => copyAction(() => NativeBridge.copyAgentConfiguration(), 'Configuration copied')}
+              onClick={() => { NativeBridge.copyAgentConfiguration(); setCopied(true); }}
               style={connected ? secondaryButtonStyle : primaryButtonStyle}
             >
-              Copy configuration
+              <span className="agent-copy-label" style={{ ...copyLabelStyle, opacity: copied ? 0 : 1, transform: copied ? 'translateY(-6px)' : 'none' }}>Copy configuration</span>
+              <span className="agent-copied-label" aria-hidden style={{ ...copiedLabelStyle, opacity: copied ? 1 : 0, transform: copied ? 'none' : 'translateY(6px)' }}>
+                <CopiedCheckIcon />
+                Copied
+              </span>
             </button>
             <div style={twoColumnStyle}>
               <button className="agent-control" onClick={() => NativeBridge.addToCursor()} style={secondaryButtonStyle}>
@@ -307,26 +302,19 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
                 Setup guide
               </button>
             </div>
-            <p style={helperStyle}>
-              {feedback || 'Paste into your agent’s MCP settings. Flumen must stay open.'}
-            </p>
+            <p style={helperStyle}>Paste into your agent’s MCP settings. Flumen must stay open.</p>
           </section>
         )}
 
         {enabledAndHealthy && (
           <section style={rowSectionStyle}>
             <div style={{ minWidth: 0 }}>
-              <div style={rowTitleStyle}>Approvals</div>
-              <div style={helperStyle}>
-                {settings.allowProposals
-                  ? 'Each change waits for you. Off applies it immediately.'
-                  : 'Changes apply immediately. Reading tasks and sessions is unchanged.'}
-              </div>
+              <div style={rowTitleStyle}>Ask before applying</div>
             </div>
             <button
               className="agent-control"
               role="switch"
-              aria-label="Allow proposals"
+              aria-label="Ask before applying"
               aria-checked={settings.allowProposals}
               onClick={() => persistSettings({ allowProposals: !settings.allowProposals })}
               style={toggleStyle(settings.allowProposals)}
@@ -336,26 +324,6 @@ const AgentAccessView: React.FC<AgentAccessViewProps> = ({ onBack }) => {
           </section>
         )}
 
-        {settings.enabled && (
-          <section style={manualSectionStyle}>
-            <button className="agent-control" aria-expanded={manualOpen} onClick={toggleManual} style={disclosureStyle}>
-              <span>Manual setup</span>
-              <span aria-hidden style={{ ...chevronStyle, transform: manualOpen ? 'rotate(90deg)' : 'none' }}>›</span>
-            </button>
-            {manualOpen && (
-              <div style={pathRowStyle}>
-                <code style={pathStyle}>{helperPath || '…'}</code>
-                <button
-                  className="agent-control"
-                  onClick={() => copyAction(() => NativeBridge.copyAgentServerCommand(), 'Helper path copied')}
-                  style={copyChipStyle}
-                >
-                  Copy
-                </button>
-              </div>
-            )}
-          </section>
-        )}
       </div>
 
       {consentStep > 0 && (
@@ -428,6 +396,7 @@ const panelMotion = `
   .agent-access-panel { animation: agentPanelIn 520ms ${SPRING} both; }
   .agent-consent > div { animation: agentConsentIn 560ms ${SPRING} both; }
   .agent-control { transition: transform 240ms ${SPRING}, background-color 240ms ${SPRING}, opacity 240ms ${SPRING}; }
+  .agent-copy-label, .agent-copied-label { transition: opacity 420ms ${SPRING}, transform 420ms ${SPRING}; }
   .agent-control:not(:disabled):active { transform: scale(0.97); }
   .agent-control:focus-visible { outline: 2px solid ${theme.colors.focus.primary}; outline-offset: 2px; }
   @media (prefers-reduced-motion: reduce) {
@@ -453,21 +422,17 @@ const confirmActionsStyle: React.CSSProperties = { display: 'grid', gridTemplate
 
 const sectionStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 8 };
 const rowSectionStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, paddingTop: 16, borderTop: `1px solid ${theme.colors.border}` };
-const manualSectionStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 10, paddingTop: 16, borderTop: `1px solid ${theme.colors.border}` };
 const rowTitleStyle: React.CSSProperties = { color: theme.colors.text.primary, fontSize: '0.85rem', fontWeight: 500 };
 const helperStyle: React.CSSProperties = { margin: '2px 0 0', fontSize: '0.7rem', lineHeight: 1.45, color: theme.colors.text.muted };
 const twoColumnStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 };
 
-const primaryButtonStyle: React.CSSProperties = { minHeight: 40, borderRadius: theme.radii.button, border: 'none', background: theme.colors.text.primary, color: theme.colors.background, fontFamily: theme.fonts.display, fontWeight: 650, fontSize: '0.8rem', cursor: 'pointer', padding: '0 16px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, whiteSpace: 'nowrap' };
+const primaryButtonStyle: React.CSSProperties = { position: 'relative', minHeight: 40, borderRadius: theme.radii.button, border: 'none', background: theme.colors.text.primary, color: theme.colors.background, fontFamily: theme.fonts.display, fontWeight: 650, fontSize: '0.8rem', cursor: 'pointer', padding: '0 16px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, whiteSpace: 'nowrap', overflow: 'hidden' };
+const copyLabelStyle: React.CSSProperties = { display: 'inline-flex', alignItems: 'center' };
+const copiedLabelStyle: React.CSSProperties = { position: 'absolute', inset: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, pointerEvents: 'none' };
+const inlineIconStyle: React.CSSProperties = { width: ICON_SIZE, height: ICON_SIZE, flex: '0 0 auto', display: 'block' };
 const secondaryButtonStyle: React.CSSProperties = { ...primaryButtonStyle, color: theme.colors.text.primary, background: theme.colors.button.background, border: `1px solid ${theme.colors.border}` };
 const smallSecondaryStyle: React.CSSProperties = { ...secondaryButtonStyle, minHeight: 34, fontSize: '0.75rem' };
 const smallDangerStyle: React.CSSProperties = { ...smallSecondaryStyle, background: 'rgba(255,95,87,.1)', color: theme.colors.focus.primary, border: '1px solid rgba(255,95,87,.28)' };
-
-const disclosureStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', border: 'none', background: 'transparent', color: theme.colors.text.primary, padding: 0, fontFamily: theme.fonts.display, fontSize: '0.85rem', fontWeight: 500, cursor: 'pointer' };
-const chevronStyle: React.CSSProperties = { display: 'inline-block', color: theme.colors.text.muted, fontSize: 18, lineHeight: 1, transition: `transform 320ms ${SPRING}` };
-const pathRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderRadius: 12, background: theme.colors.surface, border: `1px solid ${theme.colors.border}` };
-const pathStyle: React.CSSProperties = { flex: 1, minWidth: 0, fontFamily: theme.fonts.mono, fontSize: 10, lineHeight: 1.5, color: theme.colors.text.secondary, overflowWrap: 'anywhere' };
-const copyChipStyle: React.CSSProperties = { ...secondaryButtonStyle, minHeight: 28, padding: '0 12px', fontSize: '0.7rem', flexShrink: 0 };
 
 const toggleStyle = (enabled: boolean): React.CSSProperties => ({ position: 'relative', width: 44, height: 24, border: 0, borderRadius: 12, background: enabled ? theme.colors.focus.primary : 'rgba(255,255,255,.1)', padding: 0, cursor: 'pointer', flexShrink: 0, transition: 'background-color 0.3s cubic-bezier(0.4, 0, 0.2, 1)' });
 const toggleKnobStyle = (enabled: boolean): React.CSSProperties => ({ position: 'absolute', top: 3, left: enabled ? 23 : 3, width: 18, height: 18, borderRadius: '50%', background: 'white', transition: 'left 0.3s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: '0 2px 4px rgba(0,0,0,.2)' });

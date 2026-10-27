@@ -1,13 +1,5 @@
 # MCP icon source
 
-`mcp-icon.png` (128×128) is derived from `marketing/branding/assets/logo-mark.png`.
+`mcp-icon.png` is the Flumen mark kept for a future client that can render MCP icons.
 
-The packaged helper embeds this PNG as a SEP-973 `data:image/png;base64,...` URI in `FlumenMCPIcons.swift`, so `Contents/Helpers/flumen-mcp` stays self-contained.
-
-To regenerate after a brand update:
-
-```bash
-sips -z 128 128 marketing/branding/assets/logo-mark.png \
-  --out macos/Pomodoro/MCP/Resources/mcp-icon.png
-# then refresh the base64 constant in FlumenMCPIcons.swift
-```
+The helper does not embed this image in `initialize`, tools, resources, or prompts. Several MCP clients reject the handshake when those optional fields are present, so the wire protocol stays on the baseline schema.

@@ -67,13 +67,44 @@ describe('AgentAccessView', () => {
     expect(NativeBridge.disconnectAgentSessions).toHaveBeenCalled();
   });
 
+  it('counts one Codex window once when Codex opens several helpers', () => {
+    const view = render(<AgentAccessView onBack={vi.fn()} />);
+    emit('agentAccessSettings', { enabled: true });
+    emit('agentConnectionStatus', {
+      status: 'connected',
+      enabled: true,
+      connections: [
+        { id: 'codex-a', name: 'codex-mcp-client' },
+        { id: 'codex-b', name: 'codex-mcp-client' },
+      ],
+    });
+    expect(screen.getByText('Codex connected')).toBeTruthy();
+    expect(screen.queryByText('Codex, Codex')).toBeNull();
+    expect(screen.queryByText('2 agents connected')).toBeNull();
+
+    emit('agentConnectionStatus', {
+      status: 'connected',
+      enabled: true,
+      connections: [
+        { id: 'codex-a', name: 'codex-mcp-client' },
+        { id: 'codex-b', name: 'codex-mcp-client' },
+        { id: 'cursor', name: 'cursor-vscode' },
+      ],
+    });
+    expect(screen.getByText('2 agents connected')).toBeTruthy();
+    expect(screen.getByText('Codex, Cursor')).toBeTruthy();
+    expect(screen.queryByText('3 agents connected')).toBeNull();
+    view.unmount();
+  });
+
   it('drops redundant labels from the connected screen', () => {
     render(<AgentAccessView onBack={vi.fn()} />);
     emit('agentAccessSettings', { enabled: true });
     emit('agentConnectionStatus', { status: 'ready', enabled: true, connections: [] });
     expect(screen.queryByText(/CONNECT AN AGENT|PERMISSIONS|Read Focus Data|Required|For support or manual MCP setup/)).toBeNull();
-    expect(screen.getByText('Approvals')).toBeTruthy();
-    expect(screen.getByText('Each change waits for you. Off applies it immediately.')).toBeTruthy();
+    expect(screen.getByText('Ask before applying')).toBeTruthy();
+    expect(screen.queryByText(/Off applies changes immediately/)).toBeNull();
+    expect(screen.queryByText(/Manual setup/)).toBeNull();
     expect(screen.getByText(/Paste into your agent’s MCP settings/)).toBeTruthy();
   });
 });
