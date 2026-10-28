@@ -16,16 +16,15 @@ A beautiful, free focus timer for macOS. Lives in your menu bar, stores data loc
 
 To install and run the app:
 1. Download the `Flumen_macOS_Universal.zip` from the link above.
-2. Unzip the file to your **Applications** folder.
-3. **Right-click** `Flumen.app` and select **Open**.
-4. Click **Open** again in the security dialog (this is required for the first launch as the app is currently ad-hoc signed).
+2. Unzip the file and move `Flumen.app` to your **Applications** folder.
+3. Open `Flumen.app`. macOS will say it can't verify the app. Click **Done**.
+4. Open **System Settings** > **Privacy & Security**, scroll down to **Security**, and click **Open Anyway** next to the Flumen message. The button stays there for about an hour after you try to open the app.
+5. Click **Open** in the dialog that follows and enter your login password.
 
-> [!TIP]
-> **If macOS blocks the app or asks to move it to the Bin:**
-> 1. Open **System Settings** > **Privacy & Security**.
-> 2. Scroll down to the **Security** section.
-> 3. You will see a message: *"Flumen.app was blocked from use because it is not from an identified developer."*
-> 4. Click **Open Anyway** and enter your password if prompted.
+You only need to do this once, because Flumen is currently ad-hoc signed and not notarized by Apple. After that, it opens normally.
+
+> [!NOTE]
+> **On macOS 13 Ventura or 14 Sonoma**, you can instead **Control-click** (or right-click) `Flumen.app` in Finder, choose **Open**, then click **Open** again. Apple removed this shortcut in macOS 15 Sequoia.
 
 ---
 

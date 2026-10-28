@@ -731,6 +731,10 @@ section {
     line-height: 1.5;
 }
 
+.modal-step-body p + p {
+    margin-top: 6px;
+}
+
 .modal-download-btn {
     width: 100%;
     justify-content: center;
